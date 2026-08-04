@@ -1,0 +1,9 @@
+[[accounts]]
+email = "account@example.com"
+password = "replace-with-your-password"
+
+# 可选：SOCKS5 代理。删除或留空 socks 则直连（不使用代理）。
+# [proxy]
+# socks = "127.0.0.1:1080"
+# username = ""
+# password = ""
