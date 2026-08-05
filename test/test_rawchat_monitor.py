@@ -3359,8 +3359,8 @@ class StatisticsTests(unittest.TestCase):
         self.assertNotIn("代理响应", lines[0])
 
 
-class TokenChartTests(unittest.TestCase):
-    def test_render_token_chart_accepts_precomputed_buckets(self):
+class CostChartTests(unittest.TestCase):
+    def test_render_chart_displays_actual_paid_cost(self):
         buckets = dashboard_module.build_token_buckets(
             [
                 make_record(
@@ -3368,6 +3368,8 @@ class TokenChartTests(unittest.TestCase):
                     inputTokens=100,
                     cacheInputTokens=50,
                     outputTokens=70,
+                    rawCost=9.99,
+                    cost=0.08,
                 )
             ]
         )
@@ -3379,11 +3381,12 @@ class TokenChartTests(unittest.TestCase):
             height=8,
         )
 
-        self.assertIn("峰值 220", chart[0])
+        self.assertIn("费用峰值 $0.08000", chart[0])
+        self.assertTrue(any("$" in line for line in chart[1:]))
 
-    def test_build_token_chart_buckets_by_five_minutes(self):
+    def test_build_chart_buckets_actual_paid_cost_by_five_minutes(self):
         self.assertTrue(hasattr(monitor, "build_token_chart"))
-        # 图表口径 = (input + cacheInput) + output
+        # 图表口径 = API 返回的实付 cost，不是原价或 token 数。
         records = [
             make_record(
                 requestTime="2026-07-14T10:00:00",
@@ -3391,6 +3394,8 @@ class TokenChartTests(unittest.TestCase):
                 cacheInputTokens=50,
                 outputTokens=70,
                 totalTokens=999,
+                rawCost=10,
+                cost=0.08,
                 ip="1.1.1.1",
             ),
             make_record(
@@ -3399,6 +3404,8 @@ class TokenChartTests(unittest.TestCase):
                 cacheInputTokens=80,
                 outputTokens=120,
                 totalTokens=999,
+                rawCost=12,
+                cost=0.12,
                 ip="1.1.1.1",
             ),
             make_record(
@@ -3407,6 +3414,8 @@ class TokenChartTests(unittest.TestCase):
                 cacheInputTokens=100,
                 outputTokens=0,
                 totalTokens=999,
+                rawCost=15,
+                cost=0.15,
                 ip="1.1.1.1",
             ),
         ]
@@ -3414,12 +3423,12 @@ class TokenChartTests(unittest.TestCase):
 
         self.assertTrue(chart)
         joined = "\n".join(chart)
-        # 10:00~10:05 bucket = (100+50+70) + (200+80+120) = 620
-        self.assertIn("620", joined)
+        # 10:00~10:05 bucket = 0.08 + 0.12 = $0.20000.
+        self.assertIn("费用峰值 $0.20000", joined)
         self.assertIn("10:00~10:05", joined)
         self.assertIn("*", joined)
 
-    def test_build_token_chart_empty_returns_placeholder(self):
+    def test_build_chart_empty_returns_placeholder(self):
         self.assertTrue(hasattr(monitor, "build_token_chart"))
         chart = monitor.build_token_chart([], width=40, height=8)
         self.assertEqual(["暂无图表数据"], chart)

@@ -247,7 +247,7 @@ class DashboardState:
     account_record_counts: dict[str, int] = field(default_factory=dict)
     unassigned_record_count: int = 0
     record_lines: list[str] = field(default_factory=list)
-    token_buckets: list[tuple[datetime, int]] = field(default_factory=list)
+    token_buckets: list[tuple[datetime, float]] = field(default_factory=list)
     proxy_request_total: int = 0
 
     def __post_init__(self) -> None:
@@ -332,8 +332,9 @@ def compute_statistics(records: list[dict[str, Any]]) -> dict[str, Any]:
 def build_token_buckets(
     records: list[dict[str, Any]],
     bucket_minutes: int = 5,
-) -> list[tuple[datetime, int]]:
-    buckets: dict[datetime, int] = {}
+) -> list[tuple[datetime, float]]:
+    """按时间桶聚合记录实付金额（保留兼容函数名）。"""
+    buckets: dict[datetime, float] = {}
     for record in records:
         parsed = _parse_datetime(record.get("requestTime"))
         if parsed is None:
@@ -345,7 +346,9 @@ def build_token_buckets(
             second=0,
             microsecond=0,
         )
-        buckets[bucket] = buckets.get(bucket, 0) + total_io_tokens(record)
+        buckets[bucket] = buckets.get(bucket, 0.0) + float(
+            _number(record.get("cost")) or 0
+        )
     return sorted(buckets.items(), key=lambda item: item[0])
 
 
@@ -395,28 +398,28 @@ def refresh_dashboard_data(
 
 
 def render_token_chart(
-    buckets: list[tuple[datetime, int]],
+    buckets: list[tuple[datetime, float]],
     bucket_minutes: int = 5,
     width: int = 60,
     height: int = 10,
 ) -> list[str]:
-    """Render precomputed token buckets as an ASCII chart."""
+    """Render precomputed actual-cost buckets as an ASCII chart."""
     if not buckets or width <= 4 or height <= 3:
         return ["暂无图表数据"]
     times = [stamp for stamp, _ in buckets]
     values = [total for _, total in buckets]
-    max_value = max(max(values), 1)
+    max_value = max(values)
 
-    gutter = 7
+    gutter = max(7, len(fmt_cost(max_value)) + 1)
     plot_width = max(2, width - gutter)
     plot_height = max(1, height - 3)
     peak_line = (
-        f"峰值 {fmt_tokens(max_value)} | 桶 {bucket_minutes}min | "
+        f"费用峰值 {fmt_cost(max_value)} | 桶 {bucket_minutes}min | "
         f"点 {len(buckets)} | {times[0].strftime('%H:%M')}~{times[-1].strftime('%H:%M')}"
     )
 
     x_count = len(buckets)
-    columns: list[int] = []
+    columns: list[float] = []
     column_times: list[datetime] = []
     for column in range(plot_width):
         index = (
@@ -430,8 +433,11 @@ def render_token_chart(
     lines: list[str] = []
     for row in range(plot_height, 0, -1):
         threshold = max_value * row / plot_height
-        cells = "".join("*" if value >= threshold else " " for value in columns)
-        lines.append(f"{fmt_tokens(int(threshold)):>{gutter - 1}}|{cells}")
+        cells = "".join(
+            "*" if max_value > 0 and value >= threshold else " "
+            for value in columns
+        )
+        lines.append(f"{fmt_cost(threshold):>{gutter - 1}}|{cells}")
 
     lines.append(" " * (gutter - 1) + "+" + "-" * plot_width)
     label_line = " " * gutter + " " * plot_width
@@ -457,7 +463,7 @@ def build_token_chart(
     width: int = 60,
     height: int = 10,
 ) -> list[str]:
-    """Aggregate raw records and render a token chart for compatibility."""
+    """Aggregate raw records and render an actual-cost chart."""
     return render_token_chart(
         build_token_buckets(records, bucket_minutes),
         bucket_minutes=bucket_minutes,
