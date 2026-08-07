@@ -86,7 +86,10 @@ class RawChatClient:
             response.raise_for_status()
             envelope = response.json()
         except requests.HTTPError as exc:
-            body = response.content if response is not None else b""
+            try:
+                body = response.content if response is not None else b""
+            except Exception:
+                body = b""
             if not isinstance(body, bytes):
                 body = str(body).encode("utf-8", "replace")
             status_code = (
@@ -511,6 +514,19 @@ class RefreshWorker:
                 outcome = self.engine.refresh()
             except RefreshCancelled:
                 return
+            except Exception as exc:
+                if self._stop_event.is_set():
+                    return
+                failure_count = getattr(self.engine, "failure_count", 0)
+                try:
+                    failure_count = max(1, int(failure_count))
+                except (TypeError, ValueError):
+                    failure_count = 1
+                outcome = RefreshOutcome(
+                    getattr(self.engine, "last_snapshot", None),
+                    str(exc) or type(exc).__name__,
+                    failure_count,
+                )
             if self._stop_event.is_set():
                 return
             self._results.put(outcome)

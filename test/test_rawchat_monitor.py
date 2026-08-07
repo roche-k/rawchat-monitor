@@ -18,6 +18,7 @@ import rawchat.client as client_module
 import rawchat.dashboard as dashboard_module
 import rawchat.runtime as runtime_module
 import requests
+from urllib3.exceptions import ProtocolError
 
 
 class ModuleBoundaryTests(unittest.TestCase):
@@ -161,6 +162,11 @@ class SnapshotFormattingTests(unittest.TestCase):
 
         self.assertEqual("-", values[0])
         self.assertEqual("-", values[-1])
+
+    def test_number_rejects_nonfinite_values(self):
+        self.assertIsNone(monitor._number(float("nan")))
+        self.assertIsNone(monitor._number(float("inf")))
+        self.assertIsNone(monitor._number(float("-inf")))
 
     def test_normalize_sorts_offsets_chronologically_and_invalid_last(self):
         normalized = monitor.normalize_codex_data(
@@ -673,6 +679,21 @@ class SourcePoolTests(unittest.TestCase):
 
         self.assertEqual("exhausted", source.status)
         self.assertEqual("two@example.com", pool.choose().email)
+
+    def test_pool_normalizes_aware_release_time_before_comparison(self):
+        release_at = monitor._parse_release_at(
+            b'{"releaseAt":"2000-01-01T00:00:00Z"}'
+        )
+        self.assertIsNotNone(release_at)
+        self.assertIsNone(release_at.tzinfo)
+
+        pool = monitor.SourcePool(
+            [{"email": "one@example.com", "password": "p1"}],
+            keys={"one@example.com": "key-1"},
+        )
+        pool.mark_quota_exhausted("one@example.com", "quota", release_at)
+
+        self.assertEqual("one@example.com", pool.choose().email)
 
 
 class ScriptedUpstream:
@@ -1334,6 +1355,188 @@ class ProxyTests(unittest.TestCase):
         self.assertTrue(handler.close_connection)
         response.close.assert_called_once_with()
 
+    def test_stream_eof_before_declared_length_is_incomplete(self):
+        handler = SimpleNamespace(
+            close_connection=False,
+            wfile=io.BytesIO(),
+        )
+        response = SimpleNamespace(
+            status_code=200,
+            headers={"Content-Length": "100"},
+            raw=SimpleNamespace(
+                read1=mock.Mock(side_effect=[b"partial", b""])
+            ),
+            _content_consumed=False,
+            close=mock.Mock(),
+        )
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock()
+
+        _, complete = monitor.RawChatProxyServer._send_stream(
+            handler, response
+        )
+
+        self.assertFalse(complete)
+        self.assertTrue(handler.close_connection)
+        self.assertEqual(b"partial", handler.wfile.getvalue())
+        response.close.assert_called_once_with()
+
+    def test_stream_header_write_error_closes_upstream_without_escaping(self):
+        pool = monitor.SourcePool(
+            [{"email": "one@example.com", "password": "p1"}],
+            keys={"one@example.com": "key-1"},
+        )
+        response = SimpleNamespace(
+            status_code=200,
+            headers={"Content-Length": "2"},
+            close=mock.Mock(),
+        )
+        handler = SimpleNamespace(
+            close_connection=False,
+            send_response=mock.Mock(side_effect=BrokenPipeError()),
+            send_header=mock.Mock(),
+            end_headers=mock.Mock(),
+            wfile=io.BytesIO(),
+        )
+
+        monitor.RawChatProxyServer._send_stream(handler, response)
+
+        self.assertTrue(handler.close_connection)
+        response.close.assert_called_once_with()
+
+    def test_buffered_response_write_error_closes_connection_without_escaping(self):
+        handler = SimpleNamespace(
+            close_connection=False,
+            send_response=mock.Mock(),
+            send_header=mock.Mock(),
+            end_headers=mock.Mock(),
+            wfile=mock.Mock(),
+        )
+        handler.wfile.write.side_effect = ConnectionResetError()
+
+        monitor.RawChatProxyServer._send_json(handler, 502, "unavailable")
+
+        self.assertTrue(handler.close_connection)
+
+    def test_request_body_disconnect_does_not_escape_proxy_handler(self):
+        pool = monitor.SourcePool(
+            [{"email": "one@example.com", "password": "p1"}],
+            keys={"one@example.com": "key-1"},
+        )
+        proxy = monitor.RawChatProxyServer(pool, "https://example.invalid")
+        handler = SimpleNamespace(
+            command="POST",
+            path="/v1/responses",
+            headers={"Content-Length": "2"},
+            rfile=mock.Mock(),
+            wfile=io.BytesIO(),
+            close_connection=False,
+            send_response=mock.Mock(),
+            send_header=mock.Mock(),
+            end_headers=mock.Mock(),
+        )
+        handler.rfile.read.side_effect = ConnectionResetError()
+
+        proxy._handle_request(handler)
+
+        handler.send_response.assert_called_once_with(400)
+        self.assertTrue(handler.close_connection)
+
+    def test_truncated_upstream_error_body_is_returned_without_proxy_traceback(self):
+        pool = monitor.SourcePool(
+            [{"email": "one@example.com", "password": "p1"}],
+            keys={"one@example.com": "key-1"},
+        )
+        proxy = monitor.RawChatProxyServer(pool, "https://example.invalid")
+
+        class BrokenBodyResponse:
+            status_code = 429
+            headers = {"Content-Type": "application/json"}
+            close = mock.Mock()
+
+            @property
+            def content(self):
+                raise ProtocolError("truncated error body")
+
+        session = mock.MagicMock()
+        session.request.return_value = BrokenBodyResponse()
+        session_context = mock.MagicMock()
+        session_context.__enter__.return_value = session
+        handler = SimpleNamespace(
+            command="POST",
+            path="/v1/responses",
+            headers={"Content-Length": "2"},
+            rfile=io.BytesIO(b"{}"),
+            wfile=io.BytesIO(),
+            close_connection=False,
+            send_response=mock.Mock(),
+            send_header=mock.Mock(),
+            end_headers=mock.Mock(),
+        )
+
+        with mock.patch.object(
+            monitor.requests, "Session", return_value=session_context
+        ):
+            proxy._handle_request(handler)
+
+        handler.send_response.assert_called_once_with(429)
+        self.assertTrue(handler.close_connection)
+
+
+    def test_raw_stream_protocol_error_after_headers_does_not_escape_handler(self):
+        pool = monitor.SourcePool(
+            [{"email": "one@example.com", "password": "p1"}],
+            keys={"one@example.com": "key-1"},
+        )
+        proxy = monitor.RawChatProxyServer(pool, "https://example.invalid")
+        read_calls = 0
+
+        def failing_read1(amount, decode_content=True):
+            nonlocal read_calls
+            self.assertEqual(8192, amount)
+            self.assertTrue(decode_content)
+            read_calls += 1
+            if read_calls == 1:
+                return b"data: first\n\n"
+            raise ProtocolError("Connection broken: IncompleteRead(0 bytes read)")
+
+        response = SimpleNamespace(
+            status_code=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Content-Length": "100",
+            },
+            raw=SimpleNamespace(read1=failing_read1),
+            _content_consumed=False,
+            close=mock.Mock(),
+        )
+        session = mock.MagicMock()
+        session.request.return_value = response
+        session_context = mock.MagicMock()
+        session_context.__enter__.return_value = session
+        handler = SimpleNamespace(
+            command="POST",
+            path="/v1/responses",
+            headers={"Content-Length": "2"},
+            rfile=io.BytesIO(b"{}"),
+            wfile=io.BytesIO(),
+            close_connection=False,
+            send_response=mock.Mock(),
+            send_header=mock.Mock(),
+            end_headers=mock.Mock(),
+        )
+
+        with mock.patch.object(
+            monitor.requests, "Session", return_value=session_context
+        ):
+            proxy._handle_request(handler)
+
+        handler.send_response.assert_called_once_with(200)
+        self.assertEqual(b"data: first\n\n", handler.wfile.getvalue())
+        self.assertTrue(handler.close_connection)
+        response.close.assert_called_once_with()
+
     def test_proxy_uses_separate_connect_and_read_timeouts(self):
         pool = monitor.SourcePool(
             [{"email": "one@example.com", "password": "p1"}],
@@ -1562,6 +1765,29 @@ class ClientTests(unittest.TestCase):
 
         self.assertEqual(403, raised.exception.status_code)
         self.assertEqual(body, raised.exception.body)
+
+    def test_http_error_with_truncated_body_still_becomes_rawchat_error(self):
+        class BrokenBodyResponse:
+            status_code = 502
+
+            def raise_for_status(self):
+                raise requests.HTTPError("502 Bad Gateway")
+
+            @property
+            def content(self):
+                raise ProtocolError("truncated error body")
+
+        session = mock.Mock()
+        session.get.return_value = BrokenBodyResponse()
+        client = monitor.RawChatClient(
+            session=session, email="user@example.com", password="secret"
+        )
+
+        with self.assertRaises(monitor.RawChatError) as raised:
+            client.fetch_codex()
+
+        self.assertEqual(502, raised.exception.status_code)
+        self.assertEqual(b"", raised.exception.body)
 
     def test_fetch_balance_uses_billing_profile_endpoint(self):
         session = mock.Mock()
@@ -2039,6 +2265,49 @@ class RefreshEngineTests(unittest.TestCase):
         worker.stop()
         self.assertFalse(worker.request_refresh())
 
+    def test_worker_survives_unexpected_refresh_exception_and_clears_pending(self):
+        snapshot = monitor.DashboardSnapshot(
+            {"recentRecords": []}, None, None, datetime(2026, 7, 14, 10, 0)
+        )
+
+        class FlakyEngine:
+            last_snapshot = None
+            failure_count = 0
+
+            def __init__(self):
+                self.calls = 0
+
+            def refresh(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise TypeError("unexpected data shape")
+                return monitor.RefreshOutcome(snapshot, None, 0)
+
+        engine = FlakyEngine()
+        worker = monitor.RefreshWorker(engine)
+        worker.start()
+        try:
+            self.assertTrue(worker.request_refresh())
+            first = None
+            deadline = time.monotonic() + 1
+            while first is None and time.monotonic() < deadline:
+                first = worker.get_result()
+                time.sleep(0.01)
+
+            self.assertIsNotNone(first)
+            self.assertIn("unexpected data shape", first.error)
+            self.assertTrue(worker._thread.is_alive())
+            self.assertTrue(worker.request_refresh())
+
+            second = None
+            deadline = time.monotonic() + 1
+            while second is None and time.monotonic() < deadline:
+                second = worker.get_result()
+                time.sleep(0.01)
+            self.assertIs(snapshot, second.snapshot)
+        finally:
+            worker.stop()
+
     def test_stop_returns_promptly_and_skips_followup_requests(self):
         started = threading.Event()
         release = threading.Event()
@@ -2301,6 +2570,26 @@ class LayoutTests(unittest.TestCase):
         self.assertIn("请求 9", lines[0])
         self.assertIn("解除 07-14 11:00:00", lines[0])
 
+    def test_navigation_accounts_for_current_account_summary_row(self):
+        class CurrentAccountPool:
+            def account_count(self):
+                return 1
+
+            def current_email(self):
+                return "test@example.com"
+
+        state = monitor.DashboardState(
+            snapshot=self.snapshot("a"),
+            all_records=[{"requestId": str(index)} for index in range(20)],
+            source_pool=CurrentAccountPool(),
+        )
+
+        monitor.handle_key_for_screen(
+            state, monitor.curses.KEY_NPAGE, (30, 120)
+        )
+
+        self.assertEqual(11, state.selected_row)
+
 
 class FakeWindow:
     def __init__(self, rows, columns):
@@ -2403,6 +2692,34 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(9, layout.chart_rows)
         self.assertEqual(7, layout.chart_y)
 
+    def test_render_places_chart_at_reserved_layout_row(self):
+        screen = FakeWindow(30, 120)
+
+        with mock.patch.object(
+            monitor.curses,
+            "newpad",
+            side_effect=lambda rows, columns: FakeWindow(rows, columns),
+        ), mock.patch.object(monitor.curses, "doupdate"), mock.patch.object(
+            monitor.curses,
+            "color_pair",
+            return_value=0,
+        ), mock.patch.object(
+            dashboard_module,
+            "render_token_chart",
+            return_value=["chart-row-0", "chart-row-1"],
+        ):
+            monitor.render_dashboard(
+                screen,
+                self.state(),
+                datetime(2026, 7, 14, 10, 20),
+                0.0,
+            )
+
+        chart_writes = [
+            write for write in screen.writes if write[2].startswith("chart-row")
+        ]
+        self.assertEqual([7, 8], [write[0] for write in chart_writes])
+
     def test_small_terminal_draws_size_warning_without_pads(self):
         self.assertTrue(hasattr(monitor, "render_dashboard"))
         screen = FakeWindow(5, 40)
@@ -2418,6 +2735,26 @@ class RendererTests(unittest.TestCase):
         self.assertTrue(
             any("终端太小" in str(write) for write in screen.writes)
         )
+
+    def test_render_ignores_newpad_error_during_resize(self):
+        screen = FakeWindow(30, 120)
+
+        with mock.patch.object(
+            monitor.curses, "newpad", side_effect=monitor.curses.error
+        ), mock.patch.object(monitor.curses, "doupdate"):
+            monitor.render_dashboard(
+                screen, self.state(), datetime(2026, 7, 14, 10, 20), 0.0
+            )
+
+    def test_render_ignores_doupdate_error_during_terminal_close(self):
+        screen = FakeWindow(5, 40)
+
+        with mock.patch.object(
+            monitor.curses, "doupdate", side_effect=monitor.curses.error
+        ):
+            monitor.render_dashboard(
+                screen, self.state(), datetime(2026, 7, 14, 10, 20), 0.0
+            )
 
     def test_render_uses_precomputed_token_buckets(self):
         screen = FakeWindow(30, 120)
@@ -2470,10 +2807,10 @@ class RendererTests(unittest.TestCase):
             )
 
         self.assertEqual(2, len(pads))
-        self.assertEqual((0, 8, 16, 0, 16, 79), pads[0].refreshes[-1])
+        self.assertEqual((0, 8, 16, 0, 16, 78), pads[0].refreshes[-1])
         self.assertEqual(12, pads[1].rows)
         self.assertEqual(12, len(pads[1].writes))
-        self.assertEqual((0, 8, 17, 0, 28, 79), pads[1].refreshes[-1])
+        self.assertEqual((0, 8, 17, 0, 28, 78), pads[1].refreshes[-1])
 
     def test_failure_footer_contains_complete_error(self):
         self.assertTrue(hasattr(monitor, "footer_text"))
@@ -2575,7 +2912,7 @@ class RendererTests(unittest.TestCase):
         self.assertIn("TAIL-MARKER", footer_write[2])
         self.assertEqual(100, footer_write[-1])
         self.assertLessEqual(
-            pads[0].refreshes[-1][1], max(0, monitor.TABLE_WIDTH - 80)
+            pads[0].refreshes[-1][1], max(0, monitor.TABLE_WIDTH - 79)
         )
 
     def test_unknown_status_uses_neutral_color(self):
@@ -2684,6 +3021,45 @@ class EventLoopTests(unittest.TestCase):
             monitor.run_dashboard(screen, worker_factory=FakeWorker)
 
         self.assertEqual(1, render.call_count)
+
+    def test_run_dashboard_handles_resize_before_navigation(self):
+        screen = InteractiveWindow(
+            30, 120, [monitor.curses.KEY_RESIZE, ord("q")]
+        )
+
+        class FakeWorker:
+            def start(self):
+                return None
+
+            def request_refresh(self):
+                return True
+
+            def get_result(self):
+                return None
+
+            def stop(self):
+                return None
+
+        with tempfile.TemporaryDirectory(dir="test") as temp_dir, mock.patch.object(
+            runtime_module,
+            "LOG_DIR",
+            temp_dir,
+        ), mock.patch.object(
+            runtime_module,
+            "render_dashboard",
+        ), mock.patch.object(
+            runtime_module,
+            "handle_key_for_screen",
+        ) as handle_key, mock.patch.object(
+            runtime_module.curses,
+            "update_lines_cols",
+        ) as update_lines_cols:
+            handle_key.side_effect = ["quit"]
+            monitor.run_dashboard(screen, worker_factory=FakeWorker)
+
+        update_lines_cols.assert_called_once_with()
+        self.assertEqual(1, handle_key.call_count)
+        self.assertEqual(ord("q"), handle_key.call_args.args[1])
 
     def test_main_rejects_non_interactive_output(self):
         self.assertTrue(hasattr(monitor, "run_dashboard"))
@@ -2925,6 +3301,30 @@ class RuntimeTests(unittest.TestCase):
         worker.start.assert_not_called()
         config.apply.assert_not_called()
 
+    def test_config_apply_error_becomes_dashboard_error(self):
+        snapshot = monitor.DashboardSnapshot(
+            {"recentRecords": []}, None, None, datetime(2026, 7, 14, 10, 0)
+        )
+        outcome = monitor.RefreshOutcome(snapshot, None, 0)
+        worker = mock.Mock()
+        worker.get_result.side_effect = [outcome, None]
+        proxy = mock.Mock()
+        config = mock.Mock()
+        config.apply.side_effect = PermissionError("config is read-only")
+        runtime = monitor.MonitorRuntime(
+            worker, proxy, config, apply_codex_config=True
+        )
+        state = monitor.DashboardState()
+
+        self.assertTrue(
+            runtime_module.drain_refresh_results(
+                worker, state, on_outcome=runtime.handle_outcome
+            )
+        )
+
+        self.assertIn("配置接管失败", state.error)
+        self.assertIn("read-only", state.error)
+
 
 class RecordStoreTests(unittest.TestCase):
     def _tmp_log(self, tmp_path=None):
@@ -3131,6 +3531,33 @@ class HistoryViewTests(unittest.TestCase):
             if write[0] >= 5 and write[1] == 119
         ]
         self.assertTrue(any(ch in ("█", "│") for ch in scroll_chars))
+
+    def test_render_submits_screen_once_without_overwriting_pads(self):
+        screen = FakeWindow(30, 120)
+        history = [
+            {"requestId": str(i), "requestTime": f"2026-07-14T10:{i:02d}:00"}
+            for i in range(100)
+        ]
+        state = self.state_with_history(20, history)
+        pads = []
+
+        def make_pad(rows, columns):
+            pad = FakeWindow(rows, columns)
+            pads.append(pad)
+            return pad
+
+        with mock.patch.object(
+            monitor.curses, "newpad", side_effect=make_pad
+        ), mock.patch.object(monitor.curses, "doupdate"), mock.patch.object(
+            monitor.curses, "color_pair", return_value=0
+        ):
+            monitor.render_dashboard(
+                screen, state, datetime(2026, 7, 14, 10, 20), 0.0
+            )
+
+        self.assertEqual(1, len(screen.refreshes))
+        self.assertEqual(118, pads[0].refreshes[-1][-1])
+        self.assertEqual(118, pads[1].refreshes[-1][-1])
 
     def test_render_uses_visible_slice_of_history_table(self):
         self.assertTrue(hasattr(monitor, "render_dashboard"))
@@ -3427,6 +3854,21 @@ class CostChartTests(unittest.TestCase):
         self.assertIn("费用峰值 $0.20000", joined)
         self.assertIn("10:00~10:05", joined)
         self.assertIn("*", joined)
+
+    def test_build_chart_buckets_normalizes_mixed_timezone_records(self):
+        buckets = dashboard_module.build_token_buckets(
+            [
+                make_record(
+                    requestTime="2026-07-14T10:00:00", cost=0.08
+                ),
+                make_record(
+                    requestTime="2026-07-14T10:01:00+00:00", cost=0.12
+                ),
+            ]
+        )
+
+        self.assertTrue(buckets)
+        self.assertTrue(all(stamp.tzinfo is None for stamp, _ in buckets))
 
     def test_build_chart_empty_returns_placeholder(self):
         self.assertTrue(hasattr(monitor, "build_token_chart"))

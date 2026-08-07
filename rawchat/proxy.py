@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
 from .config import (
     UPSTREAM_CONNECT_TIMEOUT,
@@ -163,7 +164,11 @@ class RawChatProxyServer:
             return None
         if length < 0:
             return None
-        body = handler.rfile.read(length)
+        try:
+            body = handler.rfile.read(length)
+        except Exception:
+            handler.close_connection = True
+            return None
         return body if len(body) == length else None
 
     @staticmethod
@@ -213,14 +218,17 @@ class RawChatProxyServer:
         headers: requests.structures.CaseInsensitiveDict[str] | dict[str, str],
         body: bytes,
     ) -> None:
-        handler.send_response(status)
-        for name, value in RawChatProxyServer._safe_response_headers(
-            headers, len(body)
-        ).items():
-            handler.send_header(name, value)
-        handler.end_headers()
-        if body:
-            handler.wfile.write(body)
+        try:
+            handler.send_response(status)
+            for name, value in RawChatProxyServer._safe_response_headers(
+                headers, len(body)
+            ).items():
+                handler.send_header(name, value)
+            handler.end_headers()
+            if body:
+                handler.wfile.write(body)
+        except Exception:
+            handler.close_connection = True
 
     @staticmethod
     def _send_json(
@@ -241,18 +249,25 @@ class RawChatProxyServer:
         response: requests.Response,
     ) -> tuple[float, bool]:
         content_length = _number(response.headers.get("Content-Length"))
-        length = int(content_length) if content_length is not None else None
+        length = (
+            int(content_length)
+            if content_length is not None
+            and content_length >= 0
+            and content_length.is_integer()
+            else None
+        )
         response_headers = RawChatProxyServer._safe_response_headers(
             response.headers, length
         )
         if length is None:
             response_headers["Connection"] = "close"
             handler.close_connection = True
-        handler.send_response(response.status_code)
-        for name, value in response_headers.items():
-            handler.send_header(name, value)
-        handler.end_headers()
+        bytes_sent = 0
         try:
+            handler.send_response(response.status_code)
+            for name, value in response_headers.items():
+                handler.send_header(name, value)
+            handler.end_headers()
             raw = getattr(response, "raw", None)
             read1 = getattr(raw, "read1", None)
             content_consumed = getattr(response, "_content_consumed", False)
@@ -263,21 +278,29 @@ class RawChatProxyServer:
                         break
                     handler.wfile.write(chunk)
                     handler.wfile.flush()
+                    bytes_sent += len(chunk)
+                    if length is not None and bytes_sent >= length:
+                        break
             else:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         handler.wfile.write(chunk)
                         handler.wfile.flush()
-        except (
-            BrokenPipeError,
-            ConnectionResetError,
-            requests.RequestException,
-        ):
+                        bytes_sent += len(chunk)
+                        if length is not None and bytes_sent >= length:
+                            break
+        except Exception:
             handler.close_connection = True
             return time.monotonic(), False
         finally:
-            response.close()
-        return time.monotonic(), True
+            try:
+                response.close()
+            except Exception:
+                pass
+        complete = length is None or bytes_sent >= length
+        if not complete:
+            handler.close_connection = True
+        return time.monotonic(), complete
 
     @staticmethod
     def _error_category(body: bytes) -> str:
@@ -385,11 +408,13 @@ class RawChatProxyServer:
                     )
                     first_byte_at = time.monotonic()
                     quota_candidate = response.status_code in {402, 403, 429}
-                    error_body = (
-                        response.content
-                        if 400 <= response.status_code < 600
-                        else b""
-                    )
+                    error_body = b""
+                    if 400 <= response.status_code < 600:
+                        try:
+                            error_body = response.content
+                        except Exception:
+                            error_body = b""
+                            handler.close_connection = True
                     quota_error = (
                         quota_candidate
                         and is_quota_error(response.status_code, error_body)
@@ -415,7 +440,10 @@ class RawChatProxyServer:
                                 response.headers,
                                 error_body,
                             )
-                            response.close()
+                            try:
+                                response.close()
+                            except Exception:
+                                handler.close_connection = True
                             response_finished_at = time.monotonic()
                             self._log_event(
                                 "upstream_response",
@@ -461,7 +489,10 @@ class RawChatProxyServer:
                             response.headers,
                             error_body,
                         )
-                        response.close()
+                        try:
+                            response.close()
+                        except Exception:
+                            handler.close_connection = True
                         response_finished_at = time.monotonic()
                         self._log_event(
                             "upstream_response",
@@ -505,7 +536,7 @@ class RawChatProxyServer:
                         response_complete=response_complete,
                     )
                     return
-            except requests.RequestException as exc:
+            except (OSError, requests.RequestException, Urllib3HTTPError) as exc:
                 self._log_event(
                     "upstream_request_error",
                     source=self.source_pool.source_label(source.email),

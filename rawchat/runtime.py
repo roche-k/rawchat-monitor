@@ -29,6 +29,7 @@ from .dashboard import (
     DashboardState,
     _records,
     apply_outcome,
+    build_summary_lines,
     handle_key,
     init_curses,
     layout_for_size,
@@ -116,15 +117,20 @@ class MonitorRuntime:
         self._started = True
         return refreshing
 
-    def handle_outcome(self, outcome: RefreshOutcome) -> None:
+    def handle_outcome(self, outcome: RefreshOutcome) -> str | None:
         if (
             self.apply_codex_config
             and not self._config_applied
             and outcome.error is None
             and outcome.snapshot is not None
         ):
-            self.config_manager.apply()
-            self._config_applied = True
+            try:
+                self.config_manager.apply()
+            except Exception as exc:
+                return f"配置接管失败: {exc}"
+            else:
+                self._config_applied = True
+        return None
 
     def stop(self) -> None:
         if self._stopped:
@@ -202,25 +208,20 @@ def drain_refresh_results(
         apply_outcome(state, outcome, store=store)
         changed = True
         if callable(on_outcome):
-            on_outcome(outcome)
+            try:
+                callback_error = on_outcome(outcome)
+            except Exception as exc:
+                callback_error = f"刷新结果处理失败: {exc}"
+            if callback_error:
+                state.error = str(callback_error)
+                state.failure_count = max(1, state.failure_count)
 
 
 def handle_key_for_screen(
     state: DashboardState, key: int, screen_size: tuple[int, int]
 ) -> str | None:
     rows, columns = screen_size
-    snapshot_count = (
-        len(state.snapshot.per_account)
-        if state.snapshot and state.snapshot.per_account
-        else 0
-    )
-    pool_count = (
-        state.source_pool.account_count()
-        if state.source_pool is not None
-        and hasattr(state.source_pool, "account_count")
-        else 1
-    )
-    summary_count = max(1, snapshot_count or pool_count)
+    summary_count = len(build_summary_lines(state, datetime.now(), 0.0))
     layout = layout_for_size(rows, columns, summary_count)
     visible_rows = layout.visible_rows if layout else 1
     history = state.all_records if state.all_records else _records(state.snapshot)
@@ -293,6 +294,14 @@ def run_dashboard(
 
             key = stdscr.getch()
             if key == -1:
+                continue
+            if key == curses.KEY_RESIZE:
+                try:
+                    curses.update_lines_cols()
+                except (AttributeError, curses.error):
+                    pass
+                needs_render = True
+                last_screen_size = None
                 continue
             action = handle_key_for_screen(state, key, screen_size)
             if action == "quit":

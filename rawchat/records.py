@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -30,8 +31,11 @@ def _parse_datetime(value: Any) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone().replace(tzinfo=None)
+        return parsed
+    except (ValueError, OverflowError, OSError):
         return None
 
 
@@ -48,9 +52,9 @@ def _request_sort_key(record: dict[str, Any]) -> tuple[int, float]:
 def _number(value: Any) -> float | None:
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return None
-    return number if number == number else None
+    return number if math.isfinite(number) else None
 
 
 def _is_noise(record: dict[str, Any]) -> bool:

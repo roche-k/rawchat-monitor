@@ -152,6 +152,8 @@ class SourcePool:
         reason: str = "",
         release_at: datetime | None = None,
     ) -> None:
+        if release_at is not None and release_at.tzinfo is not None:
+            release_at = release_at.astimezone().replace(tzinfo=None)
         with self._lock:
             for source in self._sources:
                 if source.email == email:

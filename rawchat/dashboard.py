@@ -339,8 +339,6 @@ def build_token_buckets(
         parsed = _parse_datetime(record.get("requestTime"))
         if parsed is None:
             continue
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone()
         bucket = parsed.replace(
             minute=(parsed.minute // bucket_minutes) * bucket_minutes,
             second=0,
@@ -833,7 +831,10 @@ def render_dashboard(
             stdscr.noutrefresh()
         except curses.error:
             pass
-        curses.doupdate()
+        try:
+            curses.doupdate()
+        except curses.error:
+            pass
         return
 
     records = state.all_records if state.all_records else _records(state.snapshot)
@@ -865,11 +866,10 @@ def render_dashboard(
         width=min(MAX_CHART_WIDTH, columns - 2),
         height=layout.chart_rows,
     )
-    chart_y = layout.header_rows + len(stats_lines)
     for offset, line in enumerate(chart):
         _safe_addnstr(
             stdscr,
-            chart_y + offset,
+            layout.chart_y + offset,
             0,
             line,
             columns - 1,
@@ -885,16 +885,30 @@ def render_dashboard(
     _safe_addnstr(
         stdscr, layout.footer_y, 0, footer, columns - 1, footer_attr
     )
+
+    body_height = min(layout.visible_rows, max(1, len(records)))
+    has_scrollbar = len(records) > body_height and body_height > 0
+    table_max_col = columns - 2 if has_scrollbar else columns - 1
+    _render_scrollbar(
+        stdscr,
+        state,
+        len(records),
+        body_height,
+        layout.records_y,
+        columns - 1,
+    )
     try:
         stdscr.noutrefresh()
     except curses.error:
         pass
 
     pad_width = max(TABLE_WIDTH + 1, columns)
-    table_offset = min(
-        state.column_offset, max(0, TABLE_WIDTH - columns)
-    )
-    header_pad = curses.newpad(1, pad_width)
+    table_width = table_max_col + 1
+    table_offset = min(state.column_offset, max(0, TABLE_WIDTH - table_width))
+    try:
+        header_pad = curses.newpad(1, pad_width)
+    except curses.error:
+        return
     _safe_addnstr(
         header_pad,
         0,
@@ -910,11 +924,13 @@ def render_dashboard(
         layout.table_header_y,
         0,
         layout.table_header_y,
-        columns - 1,
+        table_max_col,
     )
 
-    body_height = min(layout.visible_rows, max(1, len(records)))
-    record_pad = curses.newpad(body_height, pad_width)
+    try:
+        record_pad = curses.newpad(body_height, pad_width)
+    except curses.error:
+        return
     if records:
         visible_end = min(len(records), state.row_offset + body_height)
         for pad_row, record_index in enumerate(
@@ -948,17 +964,12 @@ def render_dashboard(
         layout.records_y,
         0,
         layout.records_y + body_height - 1,
-        columns - 1,
+        table_max_col,
     )
-    _render_scrollbar(
-        stdscr,
-        state,
-        len(records),
-        body_height,
-        layout.records_y,
-        columns - 1,
-    )
-    curses.doupdate()
+    try:
+        curses.doupdate()
+    except curses.error:
+        pass
 
 
 def _render_scrollbar(
@@ -980,10 +991,6 @@ def _render_scrollbar(
         y = records_y + offset
         char = "█" if thumb_top <= offset < thumb_top + thumb_size else "│"
         _safe_addnstr(stdscr, y, max_col, char, 1, _color(COLOR_HEADER))
-    try:
-        stdscr.noutrefresh()
-    except curses.error:
-        pass
 
 
 def init_curses(stdscr: Any) -> None:
