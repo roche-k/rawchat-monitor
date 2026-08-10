@@ -829,6 +829,50 @@ class SourcePoolTests(unittest.TestCase):
 
         self.assertEqual("one@example.com", pool.choose().email)
 
+    def test_quota_snapshots_include_keyless_and_exhausted_accounts(self):
+        pool = monitor.SourcePool(
+            [
+                {"email": "one@example.com", "password": "p1"},
+                {"email": "two@example.com", "password": "p2"},
+            ],
+            keys={"one@example.com": "key-1"},
+        )
+        now = datetime.now()
+        rolling_one = {
+            "enabled": True,
+            "window": {"limitUsd": 10, "remainingUsd": 4},
+        }
+        rolling_two = {
+            "enabled": True,
+            "window": {"limitUsd": 20, "remainingUsd": 8},
+        }
+        pool.set_rolling_snapshot("one@example.com", rolling_one, now)
+        pool.set_rolling_snapshot("two@example.com", rolling_two, now)
+        pool.mark_quota_exhausted("two@example.com", "quota")
+
+        snapshots = pool.get_fresh_rolling_snapshots(60)
+
+        self.assertEqual([rolling_one, rolling_two], snapshots)
+
+    def test_daily_snapshot_has_independent_freshness(self):
+        from datetime import timedelta
+
+        pool = monitor.SourcePool(
+            [{"email": "one@example.com", "password": "p1"}],
+            keys={"one@example.com": "key-1"},
+        )
+        past = datetime.now() - timedelta(seconds=monitor.REFRESH_INTERVAL + 1)
+        pool.set_rolling_snapshot(
+            "one@example.com",
+            {"enabled": True, "window": {"limitUsd": 10, "remainingUsd": 5}},
+            past,
+        )
+        daily = {"period": "daily", "amountLimit": 10, "remainingAmount": 7}
+        pool.set_daily_snapshot("one@example.com", daily, datetime.now())
+
+        self.assertEqual([], pool.get_fresh_rolling_snapshots(monitor.REFRESH_INTERVAL))
+        self.assertEqual([daily], pool.get_fresh_daily_snapshots(monitor.REFRESH_INTERVAL))
+
 
 class ScriptedUpstream:
     def __init__(self, scripts):
@@ -2227,6 +2271,57 @@ class ClientTests(unittest.TestCase):
             self.assertNotIn(
                 "secret", Path(cache.path).read_text(encoding="utf-8")
             )
+
+    def test_fetch_all_codex_stores_and_clears_daily_subscription_snapshot(self):
+        accounts = [{"email": "one@example.com", "password": "secret"}]
+        pool = monitor.SourcePool(accounts, keys={"one@example.com": "key-1"})
+        client = monitor.MultiAccountClient(accounts, source_pool=pool)
+        subscription = {
+            "period": "daily",
+            "amountLimit": 10,
+            "remainingAmount": 8,
+        }
+        client.clients[0].fetch_codex = mock.Mock(
+            side_effect=[
+                {"subscriptions": subscription, "recentRecords": []},
+                {"subscriptions": {}, "recentRecords": []},
+            ]
+        )
+        client.clients[0].fetch_records = mock.Mock(return_value={"items": []})
+        client.clients[0].fetch_balance = mock.Mock(return_value={})
+
+        with mock.patch.object(client_module, "ACCOUNT_REQUEST_GAP", 0):
+            client.fetch_all_codex()
+            stored, fetched_at = pool.get_daily_snapshot("one@example.com")
+            self.assertEqual(subscription, stored)
+            self.assertIsNotNone(fetched_at)
+
+            client.fetch_all_codex()
+
+        self.assertEqual((None, None), pool.get_daily_snapshot("one@example.com"))
+
+    def test_failed_codex_refresh_keeps_daily_snapshot_for_ttl(self):
+        accounts = [{"email": "one@example.com", "password": "secret"}]
+        pool = monitor.SourcePool(accounts, keys={"one@example.com": "key-1"})
+        client = monitor.MultiAccountClient(accounts, source_pool=pool)
+        subscription = {
+            "period": "daily",
+            "amountLimit": 10,
+            "remainingAmount": 8,
+        }
+        pool.set_daily_snapshot("one@example.com", subscription, datetime.now())
+        client.clients[0].fetch_codex = mock.Mock(
+            side_effect=monitor.RawChatError("temporary outage")
+        )
+
+        with mock.patch.object(client_module, "ACCOUNT_REQUEST_GAP", 0):
+            with self.assertRaises(monitor.RawChatError):
+                client.fetch_all_codex()
+
+        self.assertEqual(
+            subscription,
+            pool.get_fresh_daily_snapshots(monitor.REFRESH_INTERVAL)[0],
+        )
 
     def test_refresh_marks_daily_exhausted_account_unavailable(self):
         accounts = [
@@ -4514,14 +4609,102 @@ class CodexQuotaHeadersTests(unittest.TestCase):
                 timeout=5,
             )
             self.assertEqual(200, response.status_code)
-            # 最终成功 source 是 two@example.com
-            expected = monitor._codex_quota_headers(
-                self._rolling(remaining=15.0, limit=30.0)
-            )["x-codex-primary-used-percent"]
-            self.assertTrue(expected.startswith("50."))
+            # 路由切换只影响请求 source；额度头仍代表整个账户池。
+            expected = "59.60"
             self.assertEqual(
                 response.headers.get("x-codex-primary-used-percent"),
                 expected,
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def test_daily_subscriptions_emit_secondary_codex_headers(self):
+        now = datetime(2026, 8, 10, 12, 0)
+        reset = "2026-08-11T00:00:00"
+        headers = monitor._codex_quota_headers(
+            [],
+            now=lambda: now,
+            subscriptions=[
+                {
+                    "period": "daily",
+                    "amountLimit": 10,
+                    "usedAmount": 2,
+                    "remainingAmount": 8,
+                    "periodResetTime": reset,
+                },
+                {
+                    "period": "daily",
+                    "amountLimit": 30,
+                    "remainingAmount": 15,
+                    "periodResetTime": "2026-08-10T18:00:00",
+                },
+            ],
+        )
+        self.assertEqual("42.50", headers["x-codex-secondary-used-percent"])
+        self.assertEqual("10080", headers["x-codex-secondary-window-minutes"])
+        self.assertEqual(
+            str(int(datetime(2026, 8, 10, 18, 0).timestamp())),
+            headers["x-codex-secondary-reset-at"],
+        )
+        self.assertNotIn("x-codex-primary-used-percent", headers)
+
+    def test_daily_subscription_remaining_is_derived_from_used_amount(self):
+        headers = monitor._codex_quota_headers(
+            [],
+            subscriptions=[
+                {"period": "daily", "limit": 10, "usedAmount": 4},
+                {"period": "daily", "amountLimit": 20, "remainingAmount": 10},
+            ],
+        )
+        self.assertEqual("46.67", headers["x-codex-secondary-used-percent"])
+
+    def test_proxy_headers_include_all_accounts_after_quota_switch(self):
+        upstream, pool, proxy = self._proxy_with_snapshot(
+            [
+                {"email": "one@example.com", "password": "p1"},
+                {"email": "two@example.com", "password": "p2"},
+            ],
+            {
+                "one@example.com": self._rolling(remaining=9.0, limit=30.0),
+                "two@example.com": self._rolling(remaining=15.0, limit=30.0),
+            },
+            [(200, {"content-type": "application/json"}, b'{"id":"ok"}')],
+        )
+        pool.mark_quota_exhausted("two@example.com", "quota")
+        pool.set_daily_snapshot(
+            "one@example.com",
+            {
+                "period": "daily",
+                "amountLimit": 10,
+                "remainingAmount": 2,
+                "periodResetTime": "2099-01-02T00:00:00",
+            },
+            datetime.now(),
+        )
+        pool.set_daily_snapshot(
+            "two@example.com",
+            {
+                "period": "daily",
+                "amountLimit": 30,
+                "remainingAmount": 24,
+                "periodResetTime": "2099-01-01T00:00:00",
+            },
+            datetime.now(),
+        )
+        try:
+            response = requests.post(
+                f"{proxy.base_url}/v1/responses",
+                json={"model": "gpt-5.4", "input": "ping"},
+                timeout=5,
+            )
+            self.assertEqual(200, response.status_code)
+            self.assertEqual("60.00", response.headers.get("x-codex-primary-used-percent"))
+            self.assertEqual("35.00", response.headers.get("x-codex-secondary-used-percent"))
+            self.assertEqual("10080", response.headers.get("x-codex-secondary-window-minutes"))
+            self.assertEqual(
+                str(int(datetime(2099, 1, 1).timestamp())),
+                response.headers.get("x-codex-secondary-reset-at"),
             )
         finally:
             proxy.stop()

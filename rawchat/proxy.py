@@ -40,25 +40,52 @@ _HOP_BY_HOP_HEADERS = {
 }
 
 
-def _codex_quota_headers(rolling: Any, now: Any = datetime.now) -> dict[str, str]:
-    """将一个或多个 RawChat rolling 快照转换为 Codex 额度头。
+def _codex_quota_headers(
+    rolling: Any,
+    now: Any = datetime.now,
+    subscriptions: Any = None,
+    *,
+    daily: Any = None,
+    secondary: Any = None,
+) -> dict[str, str]:
+    """将账户池的滚动和当天快照转换为 Codex 额度头。
 
     成功注入头：
       x-codex-primary-used-percent
       x-codex-primary-window-minutes  始终 300
       x-codex-primary-reset-at        最近的有效未来 releaseAt
+      x-codex-secondary-used-percent
+      x-codex-secondary-window-minutes  始终 10080（7 天）
+      x-codex-secondary-reset-at      最近的有效未来 periodResetTime
+
+    ``now`` 保持为第二个位置参数以兼容旧调用；``daily`` 和
+    ``secondary`` 是 ``subscriptions`` 的可读别名。
     """
+    # Also accept the natural ``(rolling, subscriptions)`` form while
+    # retaining the historical ``(rolling, now)`` signature.
+    if not callable(now):
+        if subscriptions is None and daily is None and secondary is None:
+            subscriptions = now
+        now = datetime.now
+    if daily is not None:
+        subscriptions = daily
+    if secondary is not None:
+        subscriptions = secondary
+
     if isinstance(rolling, dict):
         snapshots = (rolling,)
     elif isinstance(rolling, (list, tuple)):
         snapshots = rolling
     else:
-        return {}
+        snapshots = ()
 
     total_limit = 0.0
     total_remaining = 0.0
     reset_candidates = []
-    now_value = now()
+    try:
+        now_value = _parse_datetime(now()) or datetime.now()
+    except (TypeError, ValueError):
+        now_value = datetime.now()
     for snapshot in snapshots:
         if not isinstance(snapshot, dict) or snapshot.get("enabled") is not True:
             continue
@@ -72,26 +99,84 @@ def _codex_quota_headers(rolling: Any, now: Any = datetime.now) -> dict[str, str
         total_limit += limit_usd
         total_remaining += max(0.0, min(limit_usd, remaining))
         release_str = window.get("releaseAt")
-        if isinstance(release_str, str) and release_str:
+        if release_str:
             release_at = _parse_datetime(release_str)
             if release_at is not None and release_at > now_value:
                 reset_candidates.append(release_at)
 
-    if total_limit <= 0:
-        return {}
-    used_percent = max(
-        0.0,
-        min(100.0, (1.0 - total_remaining / total_limit) * 100.0),
-    )
-    used_percent = round(used_percent, 2)
-    headers = {
-        "x-codex-primary-used-percent": f"{used_percent:.2f}",
-        "x-codex-primary-window-minutes": "300",
-    }
-    if reset_candidates:
-        headers["x-codex-primary-reset-at"] = str(
-            int(min(reset_candidates).timestamp())
+    headers: dict[str, str] = {}
+    if total_limit > 0:
+        used_percent = max(
+            0.0,
+            min(100.0, (1.0 - total_remaining / total_limit) * 100.0),
         )
+        headers.update(
+            {
+                "x-codex-primary-used-percent": f"{round(used_percent, 2):.2f}",
+                "x-codex-primary-window-minutes": "300",
+            }
+        )
+        if reset_candidates:
+            headers["x-codex-primary-reset-at"] = str(
+                int(min(reset_candidates).timestamp())
+            )
+
+    if isinstance(subscriptions, dict):
+        daily_snapshots = (subscriptions,)
+    elif isinstance(subscriptions, (list, tuple)):
+        daily_snapshots = subscriptions
+    else:
+        daily_snapshots = ()
+
+    daily_limit = 0.0
+    daily_remaining = 0.0
+    daily_reset_candidates = []
+    for subscription in daily_snapshots:
+        if not isinstance(subscription, dict):
+            continue
+        period = str(subscription.get("period") or "").strip().lower()
+        if period and period not in {"daily", "day", "1d", "24h"}:
+            continue
+        amount_limit = _number(subscription.get("amountLimit"))
+        if amount_limit is None:
+            amount_limit = _number(subscription.get("limit"))
+        if amount_limit is None or amount_limit <= 0:
+            continue
+        remaining_amount = _number(subscription.get("remainingAmount"))
+        if remaining_amount is None:
+            used_amount = _number(subscription.get("usedAmount"))
+            if used_amount is None:
+                continue
+            remaining_amount = amount_limit - used_amount
+        daily_limit += amount_limit
+        daily_remaining += max(0.0, min(amount_limit, remaining_amount))
+        reset_str = (
+            subscription.get("periodResetTime")
+            or subscription.get("periodResetAt")
+            or subscription.get("resetAt")
+        )
+        if reset_str:
+            reset_at = _parse_datetime(reset_str)
+            if reset_at is not None and reset_at > now_value:
+                daily_reset_candidates.append(reset_at)
+
+    if daily_limit > 0:
+        daily_used_percent = max(
+            0.0,
+            min(100.0, (1.0 - daily_remaining / daily_limit) * 100.0),
+        )
+        headers.update(
+            {
+                "x-codex-secondary-used-percent": (
+                    f"{round(daily_used_percent, 2):.2f}"
+                ),
+                "x-codex-secondary-window-minutes": "10080",
+            }
+        )
+        if daily_reset_candidates:
+            headers["x-codex-secondary-reset-at"] = str(
+                int(min(daily_reset_candidates).timestamp())
+            )
     return headers
 
 
@@ -414,10 +499,12 @@ class RawChatProxyServer:
         self,
         response: requests.Response,
     ) -> None:
-        snapshots = self.source_pool.get_available_rolling_snapshots(
-            REFRESH_INTERVAL
-        )
-        headers = _codex_quota_headers(snapshots)
+        # Quota headers describe the configured account pool as a whole.
+        # Routing availability (including a source that just failed quota)
+        # must not remove that account's fresh cached usage from the totals.
+        snapshots = self.source_pool.get_fresh_rolling_snapshots(REFRESH_INTERVAL)
+        subscriptions = self.source_pool.get_fresh_daily_snapshots(REFRESH_INTERVAL)
+        headers = _codex_quota_headers(snapshots, subscriptions=subscriptions)
         if not headers:
             return
         for name, value in headers.items():

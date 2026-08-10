@@ -314,6 +314,19 @@ class MultiAccountClient:
             if isinstance(subs, dict):
                 account_subs = dict(subs)
                 subscriptions.append(account_subs)
+                if account_subs:
+                    self.source_pool.set_daily_snapshot(
+                        client.email,
+                        account_subs,
+                        datetime.now(),
+                    )
+                else:
+                    self.source_pool.clear_daily_snapshot(client.email)
+            else:
+                # A successful response without subscriptions supersedes any
+                # cached daily value; failed requests deliberately retain it
+                # and let the freshness TTL decide when it expires.
+                self.source_pool.clear_daily_snapshot(client.email)
 
             usage = codex.get("currentUsage")
             if isinstance(usage, dict):

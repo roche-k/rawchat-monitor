@@ -21,6 +21,14 @@ QUOTA_KEYWORDS = (
 QUOTA_EXHAUSTED_MESSAGE = "您当前的 Codex 额度已用完，请返回网页端查看明细。"
 
 
+def _naive_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone().replace(tzinfo=None)
+    return value
+
+
 def _contains_quota_exhausted_message(value: Any) -> bool:
     if isinstance(value, bytes):
         value = value.decode("utf-8", "replace")
@@ -85,6 +93,8 @@ class SourceState:
     release_at: datetime | None = None
     rolling_limit: dict[str, Any] | None = None
     rolling_fetched_at: datetime | None = None
+    daily_limit: dict[str, Any] | None = None
+    daily_fetched_at: datetime | None = None
 
     @property
     def status(self) -> str:
@@ -157,7 +167,7 @@ class SourcePool:
             for source in self._sources:
                 if source.email == email:
                     source.rolling_limit = dict(rolling)
-                    source.rolling_fetched_at = fetched_at
+                    source.rolling_fetched_at = _naive_datetime(fetched_at)
                     return
 
     def get_rolling_snapshot(
@@ -169,35 +179,108 @@ class SourcePool:
                     return source.rolling_limit, source.rolling_fetched_at
         return None, None
 
+    def set_daily_snapshot(
+        self,
+        email: str,
+        subscriptions: dict[str, Any] | None,
+        fetched_at: datetime,
+    ) -> None:
+        """保存账户当天订阅快照；该状态独立于路由可用性。"""
+        if not isinstance(subscriptions, dict) or not subscriptions:
+            self.clear_daily_snapshot(email)
+            return
+        with self._lock:
+            for source in self._sources:
+                if source.email == email:
+                    source.daily_limit = dict(subscriptions)
+                    source.daily_fetched_at = _naive_datetime(fetched_at)
+                    return
+
+    def clear_daily_snapshot(self, email: str) -> None:
+        """清除账户最新响应中已不存在的当天订阅额度。"""
+        with self._lock:
+            for source in self._sources:
+                if source.email == email:
+                    source.daily_limit = None
+                    source.daily_fetched_at = None
+                    return
+
+    def get_daily_snapshot(
+        self, email: str
+    ) -> tuple[dict[str, Any] | None, datetime | None]:
+        with self._lock:
+            for source in self._sources:
+                if source.email == email:
+                    return source.daily_limit, source.daily_fetched_at
+        return None, None
+
+    @staticmethod
+    def _fresh(
+        fetched_at: datetime | None,
+        max_age_seconds: float | None,
+        now: datetime,
+    ) -> bool:
+        if fetched_at is None:
+            return False
+        if max_age_seconds is None:
+            return True
+        return (now - fetched_at).total_seconds() <= max_age_seconds
+
+    def get_fresh_rolling_snapshots(
+        self,
+        max_age_seconds: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """读取账户池整体的滚动快照，不按路由状态或 API key 过滤。"""
+        now = datetime.now()
+        with self._lock:
+            return [
+                dict(source.rolling_limit)
+                for source in self._sources
+                if source.rolling_limit is not None
+                and self._fresh(source.rolling_fetched_at, max_age_seconds, now)
+            ]
+
+    def get_fresh_daily_snapshots(
+        self,
+        max_age_seconds: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """读取账户池整体的当天订阅快照，不按路由状态或 API key 过滤。"""
+        now = datetime.now()
+        with self._lock:
+            return [
+                dict(source.daily_limit)
+                for source in self._sources
+                if source.daily_limit is not None
+                and self._fresh(source.daily_fetched_at, max_age_seconds, now)
+            ]
+
+    # Subscription terminology is used by the upstream payload; keep aliases
+    # so callers can use either name without changing the stored state model.
+    def set_subscription_snapshot(
+        self,
+        email: str,
+        subscriptions: dict[str, Any],
+        fetched_at: datetime,
+    ) -> None:
+        self.set_daily_snapshot(email, subscriptions, fetched_at)
+
+    def get_subscription_snapshot(
+        self, email: str
+    ) -> tuple[dict[str, Any] | None, datetime | None]:
+        return self.get_daily_snapshot(email)
+
+    def get_fresh_subscription_snapshots(
+        self,
+        max_age_seconds: float | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.get_fresh_daily_snapshots(max_age_seconds)
+
     def get_available_rolling_snapshots(
         self,
         max_age_seconds: float | None = None,
     ) -> list[dict[str, Any]]:
-        now = datetime.now()
-        with self._lock:
-            snapshots: list[dict[str, Any]] = []
-            for source in self._sources:
-                if not source.api_key:
-                    continue
-                if not source.quota_available:
-                    if source.release_at is None or now < source.release_at:
-                        continue
-                    source.quota_available = True
-                    source.reason = None
-                    source.release_at = None
-                if source.rolling_limit is None:
-                    continue
-                fetched_at = source.rolling_fetched_at
-                if (
-                    max_age_seconds is not None
-                    and (
-                        fetched_at is None
-                        or (now - fetched_at).total_seconds() > max_age_seconds
-                    )
-                ):
-                    continue
-                snapshots.append(dict(source.rolling_limit))
-            return snapshots
+        """兼容旧名称；额度头现在应代表整个账户池。"""
+        return self.get_fresh_rolling_snapshots(max_age_seconds)
 
     def update_quota(
         self,
