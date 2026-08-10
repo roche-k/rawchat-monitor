@@ -39,11 +39,11 @@ python rawchat_monitor.py /path/to/accounts.toml
 The program rejects a missing file, invalid TOML, empty account lists, and
 group/other-readable files on POSIX systems.
 
-## Optional SOCKS5 proxy
+## Optional proxy
 
 All upstream HTTPS connections (quota refresh and the local proxy) can be routed
-through a SOCKS5 proxy by adding an optional `[proxy]` table to the same
-configuration file:
+through an external SOCKS5 proxy by adding an optional `[proxy]` table to the
+same configuration file:
 
 ```toml
 [proxy]
@@ -53,9 +53,45 @@ socks = "127.0.0.1:1080"
 ```
 
 When the `[proxy]` table is absent or `socks` is empty, the program connects
-directly (default). If a proxy is configured, the `PySocks` package must be
+directly (default). For an external SOCKS5 proxy, the `PySocks` package must be
 installed (`pip install PySocks` or `pip install "requests[socks]"`); otherwise
-the program exits with a clear error instead of silently falling back.
+the program falls back to a direct connection and shows that state in the
+dashboard.
+
+### VLESS through Xray
+
+The same table can start a local Xray HTTP CONNECT listener from a VLESS share
+link:
+
+```toml
+[proxy]
+url = "vless://UUID@example.com:443?security=tls&type=tcp"
+# Optional; defaults to an executable named xray found in PATH.
+xray = "/usr/local/bin/xray"
+```
+
+The monitor maps common VLESS TLS/REALITY parameters and transports (TCP,
+WebSocket, gRPC, HTTP Upgrade and XHTTP, plus legacy link forms where the
+selected Xray version still supports them). Xray itself validates the generated
+configuration, so links using a transport removed by the installed Xray
+version fail safely to direct connection instead of being silently rewritten.
+It only starts an existing Xray executable; it never downloads one. The local
+HTTP CONNECT listener does not require PySocks. For a request failure while a
+proxy is active, the monitor first requests
+`https://www.google.com/generate_204` through that same proxy and requires HTTP
+204. A healthy proxy is kept active and the request is retried through it when
+the response has not started; only a failed health check switches subsequent
+requests to direct connection and stops managed Xray. Startup and configuration
+errors still fall back directly. The dashboard always shows whether a proxy is
+configured and whether requests are currently using it. Do not set `socks` and
+`url` together.
+
+### Proxy diagnostics
+
+Proxy events are written to `logs/rawchat_proxy_YYYY-MM-DD.jsonl`. The records
+include the original request or stream error, the Google health-check result,
+the recovery/fallback decision, and captured Xray output. Request bodies are not
+written to this log; error text is kept as returned for diagnosis.
 
 ## Log repair utility
 

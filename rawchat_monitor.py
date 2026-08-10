@@ -49,6 +49,8 @@ from rawchat.config import (
     MIN_COLS,
     MIN_ROWS,
     ProxyConfig,
+    PROXY_HEALTHCHECK_URL,
+    PROXY_HEALTHCHECK_TIMEOUT,
     QUOTA_URL,
     RECORD_LIMIT,
     RECORDS_URL,

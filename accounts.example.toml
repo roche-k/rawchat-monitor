@@ -2,8 +2,16 @@
 email = "account@example.com"
 password = "replace-with-your-password"
 
-# 可选：SOCKS5 代理。删除或留空 socks 则直连（不使用代理）。
+# 可选：外部 SOCKS5 代理。删除或留空 socks 则直连（不使用代理）。
 # [proxy]
 # socks = "127.0.0.1:1080"
 # username = ""
 # password = ""
+
+# 或者使用 VLESS 分享链接。启动 rawchat_monitor.py 时会查找系统中的
+# xray 可执行文件，自动启动本地 SOCKS，并在脚本退出时回收它。
+# 不能同时配置 socks 和 url；请求失败时会先通过 Google generate_204 检查代理，
+# 只有健康检查失败才切换为直连；启动或配置错误仍会直接连接。
+# [proxy]
+# url = "vless://UUID@example.com:443?security=tls&type=tcp"
+# xray = "/usr/local/bin/xray"

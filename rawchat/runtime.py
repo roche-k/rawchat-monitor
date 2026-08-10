@@ -144,11 +144,6 @@ def build_runtime(args: argparse.Namespace) -> MonitorRuntime:
     accounts_path = args.accounts_file or DEFAULT_ACCOUNTS_FILE
     accounts = load_accounts(accounts_path)
     proxy_config = load_proxy_config(accounts_path)
-    if proxy_config is not None:
-        try:
-            _require_socks(proxy_config)
-        except RuntimeError:
-            proxy_config.mark_failed(reason="PySocks 未安装")
     key_cache = ApiKeyCache(args.key_cache)
     cached_keys = {
         account["email"]: key_cache.get(account["email"])
@@ -173,6 +168,11 @@ def build_runtime(args: argparse.Namespace) -> MonitorRuntime:
         event_log_dir=LOG_DIR,
         proxy=proxy_config,
     )
+    if proxy_config is not None:
+        try:
+            _require_socks(proxy_config)
+        except RuntimeError:
+            proxy_config.mark_failed(reason="PySocks 未安装")
     config_manager = CodexConfigManager(
         args.codex_config,
         port=args.proxy_port,

@@ -205,6 +205,8 @@ class RawChatProxyServer:
         self._thread: threading.Thread | None = None
         self._started = False
         self._event_log_lock = threading.Lock()
+        if self.proxy is not None:
+            self.proxy.set_event_logger(self._log_event)
 
         owner = self
 
@@ -404,6 +406,7 @@ class RawChatProxyServer:
     def _send_stream(
         handler: http.server.BaseHTTPRequestHandler,
         response: requests.Response,
+        on_upstream_error: Any = None,
     ) -> tuple[float, bool]:
         content_length = _number(response.headers.get("Content-Length"))
         length = (
@@ -420,6 +423,25 @@ class RawChatProxyServer:
             response_headers["Connection"] = "close"
             handler.close_connection = True
         bytes_sent = 0
+
+        def report_upstream_error(error: BaseException) -> None:
+            if not callable(on_upstream_error):
+                return
+            try:
+                on_upstream_error(error)
+            except Exception:
+                # Diagnostics must never replace the original stream outcome.
+                return
+
+        def write_chunk(chunk: bytes) -> bool:
+            try:
+                handler.wfile.write(chunk)
+                handler.wfile.flush()
+            except Exception:
+                handler.close_connection = True
+                return False
+            return True
+
         try:
             handler.send_response(response.status_code)
             for name, value in response_headers.items():
@@ -430,19 +452,38 @@ class RawChatProxyServer:
             content_consumed = getattr(response, "_content_consumed", False)
             if callable(read1) and not content_consumed:
                 while True:
-                    chunk = read1(8192, decode_content=True)
+                    try:
+                        chunk = read1(8192, decode_content=True)
+                    except Exception as exc:
+                        handler.close_connection = True
+                        report_upstream_error(exc)
+                        return time.monotonic(), False
                     if not chunk:
                         break
-                    handler.wfile.write(chunk)
-                    handler.wfile.flush()
+                    if not write_chunk(chunk):
+                        return time.monotonic(), False
                     bytes_sent += len(chunk)
                     if length is not None and bytes_sent >= length:
                         break
             else:
-                for chunk in response.iter_content(chunk_size=8192):
+                try:
+                    chunks = iter(response.iter_content(chunk_size=8192))
+                except Exception as exc:
+                    handler.close_connection = True
+                    report_upstream_error(exc)
+                    return time.monotonic(), False
+                while True:
+                    try:
+                        chunk = next(chunks)
+                    except StopIteration:
+                        break
+                    except Exception as exc:
+                        handler.close_connection = True
+                        report_upstream_error(exc)
+                        return time.monotonic(), False
                     if chunk:
-                        handler.wfile.write(chunk)
-                        handler.wfile.flush()
+                        if not write_chunk(chunk):
+                            return time.monotonic(), False
                         bytes_sent += len(chunk)
                         if length is not None and bytes_sent >= length:
                             break
@@ -590,16 +631,23 @@ class RawChatProxyServer:
                     except (OSError, requests.RequestException) as exc:
                         if not proxy_active or self.proxy is None:
                             raise
-                        mark_failed = getattr(self.proxy, "mark_failed", None)
-                        if callable(mark_failed):
-                            mark_failed(exc)
+                        use_direct = self.proxy.handle_failure(
+                            exc,
+                            reason="上游连接失败",
+                            target=url,
+                        )
+                        proxy_active = not use_direct
                         response = session.request(
                             handler.command,
                             url,
                             headers=headers,
                             data=body,
                             stream=True,
-                            proxies={"http": None, "https": None},
+                            proxies=(
+                                {"http": None, "https": None}
+                                if use_direct
+                                else proxy_urls
+                            ),
                             timeout=(
                                 UPSTREAM_CONNECT_TIMEOUT,
                                 UPSTREAM_READ_TIMEOUT,
@@ -617,22 +665,27 @@ class RawChatProxyServer:
                             response.close()
                         except Exception:
                             handler.close_connection = True
-                        mark_failed = getattr(self.proxy, "mark_failed", None)
-                        if callable(mark_failed):
-                            mark_failed(reason="代理返回错误")
+                        use_direct = self.proxy.handle_failure(
+                            reason="代理返回错误",
+                            target=url,
+                        )
                         response = session.request(
                             handler.command,
                             url,
                             headers=headers,
                             data=body,
                             stream=True,
-                            proxies={"http": None, "https": None},
+                            proxies=(
+                                {"http": None, "https": None}
+                                if use_direct
+                                else proxy_urls
+                            ),
                             timeout=(
                                 UPSTREAM_CONNECT_TIMEOUT,
                                 UPSTREAM_READ_TIMEOUT,
                             ),
                         )
-                        proxy_active = False
+                        proxy_active = not use_direct
                     first_byte_at = time.monotonic()
                     quota_candidate = response.status_code in {402, 403, 429}
                     error_body = b""
@@ -743,8 +796,29 @@ class RawChatProxyServer:
                     if 200 <= response.status_code < 400:
                         self.source_pool.mark_success(source.email)
                         self._inject_codex_quota_headers(response)
+
+                    def on_stream_error(error: BaseException) -> None:
+                        fallback = False
+                        if proxy_active and self.proxy is not None:
+                            fallback = self.proxy.handle_failure(
+                                error,
+                                reason="上游流读取失败",
+                                target=url,
+                            )
+                        self._log_event(
+                            "upstream_stream_error",
+                            source=self.source_pool.source_label(source.email),
+                            attempt=attempt,
+                            status=response.status_code,
+                            error_type=type(error).__name__,
+                            error_message=ProxyConfig._error_message(error),
+                            target=url,
+                            proxy_active=proxy_active,
+                            fallback=fallback,
+                        )
+
                     response_finished_at, response_complete = self._send_stream(
-                        handler, response
+                        handler, response, on_stream_error
                     )
                     self._log_event(
                         "upstream_response",
@@ -770,6 +844,9 @@ class RawChatProxyServer:
                     source=self.source_pool.source_label(source.email),
                     attempt=attempt,
                     error_type=type(exc).__name__,
+                    error_message=ProxyConfig._error_message(exc),
+                    target=url,
+                    proxy_active=proxy_active,
                 )
                 self._send_json(handler, 502, "RawChat upstream unavailable")
                 return

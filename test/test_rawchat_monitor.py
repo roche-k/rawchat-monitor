@@ -3,6 +3,7 @@ import http.server
 import os
 import socket
 import inspect
+import subprocess
 import threading
 import time
 import io
@@ -590,6 +591,100 @@ class ProxyConfigTests(unittest.TestCase):
         self.assertEqual({}, proxy.requests_proxies())
         self.assertIn("直连", proxy.status_text())
 
+    def test_proxy_failure_keeps_proxy_when_google_health_check_succeeds(self):
+        proxy = monitor.ProxyConfig(socks="127.0.0.1:1080")
+        events = []
+        proxy.set_event_logger(
+            lambda event, **fields: events.append((event, fields))
+        )
+        health_response = SimpleNamespace(status_code=204, close=mock.Mock())
+        health_session = mock.MagicMock()
+        health_session.get.return_value = health_response
+        health_context = mock.MagicMock()
+        health_context.__enter__.return_value = health_session
+
+        with mock.patch(
+            "rawchat.config.requests.Session", return_value=health_context
+        ):
+            should_use_direct = proxy.handle_failure(
+                requests.ConnectionError("proxy reset"),
+                reason="上游连接失败",
+            )
+
+        self.assertFalse(should_use_direct)
+        self.assertTrue(proxy.requests_proxies())
+        self.assertEqual(
+            monitor.PROXY_HEALTHCHECK_URL,
+            health_session.get.call_args.args[0],
+        )
+        self.assertEqual(
+            {
+                "http": "socks5://127.0.0.1:1080",
+                "https": "socks5://127.0.0.1:1080",
+            },
+            health_session.get.call_args.kwargs["proxies"],
+        )
+        self.assertTrue(
+            any(
+                event == "proxy_failure_detected"
+                and fields["error_type"] == "ConnectionError"
+                for event, fields in events
+            )
+        )
+        self.assertTrue(
+            any(
+                event == "proxy_health_check"
+                and fields["healthy"] is True
+                and fields["status"] == 204
+                for event, fields in events
+            )
+        )
+        self.assertFalse(any(event == "proxy_fallback" for event, _ in events))
+
+    def test_proxy_failure_switches_direct_only_after_google_health_check_fails(self):
+        proxy = monitor.ProxyConfig(socks="127.0.0.1:1080")
+        events = []
+        proxy.set_event_logger(
+            lambda event, **fields: events.append((event, fields))
+        )
+        health_response = SimpleNamespace(status_code=503, close=mock.Mock())
+        health_session = mock.MagicMock()
+        health_session.get.return_value = health_response
+        health_context = mock.MagicMock()
+        health_context.__enter__.return_value = health_session
+
+        with mock.patch(
+            "rawchat.config.requests.Session", return_value=health_context
+        ):
+            should_use_direct = proxy.handle_failure(
+                requests.ConnectionError("proxy reset"),
+                reason="上游连接失败",
+            )
+
+        self.assertTrue(should_use_direct)
+        self.assertEqual({}, proxy.requests_proxies())
+        self.assertTrue(
+            any(
+                event == "proxy_health_check"
+                and fields["healthy"] is False
+                and fields["status"] == 503
+                for event, fields in events
+            )
+        )
+        fallback_events = [
+            fields for event, fields in events if event == "proxy_fallback"
+        ]
+        self.assertEqual(1, len(fallback_events))
+        self.assertEqual("ConnectionError", fallback_events[0]["error_type"])
+
+    def test_proxy_error_log_keeps_original_message(self):
+        message = "proxy://user:password@example.invalid " + ("x" * 1200)
+
+        self.assertEqual(
+            message,
+            monitor.ProxyConfig._error_message(RuntimeError(message)),
+        )
+
     def test_load_proxy_config_returns_none_when_absent_or_empty(self):
         with tempfile.TemporaryDirectory(dir="test") as temp_dir:
             absent = self.write_config(
@@ -688,15 +783,21 @@ class ProxyConfigTests(unittest.TestCase):
         proxy = monitor.ProxyConfig(socks="127.0.0.1:1080")
         client = monitor.RawChatClient(session=session, proxy=proxy)
 
-        self.assertEqual("key", client.fetch_codex()["apiKey"])
+        with mock.patch.object(proxy, "handle_failure", return_value=True) as handle_failure:
+            self.assertEqual("key", client.fetch_codex()["apiKey"])
+        handle_failure.assert_called_once_with(
+            mock.ANY,
+            reason="上游连接失败",
+            target=monitor.QUOTA_URL,
+        )
         self.assertEqual("key", client.fetch_codex()["apiKey"])
 
         self.assertEqual(3, session.get.call_count)
         self.assertEqual(
             {"http": None, "https": None},
-            session.get.call_args.kwargs["proxies"],
+            session.get.call_args_list[1].kwargs["proxies"],
         )
-        self.assertEqual({}, proxy.requests_proxies())
+        self.assertTrue(proxy.requests_proxies())
         client.close()
 
     def test_rawchat_client_leaves_proxies_empty_when_not_configured(self):
@@ -1535,6 +1636,83 @@ class ProxyTests(unittest.TestCase):
         self.assertTrue(handler.close_connection)
         response.close.assert_called_once_with()
 
+    def test_stream_read_error_logs_and_checks_proxy_health(self):
+        pool = monitor.SourcePool(
+            [{"email": "one@example.com", "password": "p1"}],
+            keys={"one@example.com": "key-1"},
+        )
+        proxy_config = monitor.ProxyConfig(socks="127.0.0.1:1080")
+        proxy = monitor.RawChatProxyServer(
+            pool, "https://example.invalid", proxy=proxy_config
+        )
+        read_error = requests.ConnectionError("upstream read timed out")
+
+        def failing_chunks(chunk_size):
+            self.assertEqual(8192, chunk_size)
+            yield b"data: first\n\n"
+            raise read_error
+
+        response = SimpleNamespace(
+            status_code=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Content-Length": "100",
+            },
+            content=b"",
+            iter_content=failing_chunks,
+            close=mock.Mock(),
+        )
+        session = mock.MagicMock()
+        session.request.return_value = response
+        session_context = mock.MagicMock()
+        session_context.__enter__.return_value = session
+        handler = SimpleNamespace(
+            command="POST",
+            path="/v1/responses",
+            headers={"Content-Length": "2"},
+            rfile=io.BytesIO(b"{}"),
+            wfile=io.BytesIO(),
+            close_connection=False,
+            send_response=mock.Mock(),
+            send_header=mock.Mock(),
+            end_headers=mock.Mock(),
+        )
+
+        with tempfile.TemporaryDirectory(dir="test") as temp_dir:
+            proxy.event_log_dir = Path(temp_dir)
+            with mock.patch.object(
+                monitor.requests, "Session", return_value=session_context
+            ), mock.patch.object(
+                proxy_config, "handle_failure", return_value=False
+            ) as handle_failure:
+                proxy._handle_request(handler)
+
+            paths = list(Path(temp_dir).glob("rawchat_proxy_*.jsonl"))
+            events = [
+                json.loads(line)
+                for line in paths[0].read_text(encoding="utf-8").splitlines()
+            ]
+
+        handle_failure.assert_called_once_with(
+            read_error,
+            reason="上游流读取失败",
+            target="https://example.invalid/v1/responses",
+        )
+        stream_errors = [
+            event for event in events if event["event"] == "upstream_stream_error"
+        ]
+        self.assertEqual(1, len(stream_errors))
+        self.assertEqual("ConnectionError", stream_errors[0]["error_type"])
+        self.assertIn("upstream read timed out", stream_errors[0]["error_message"])
+        response_events = [
+            event for event in events if event["event"] == "upstream_response"
+        ]
+        self.assertEqual(1, len(response_events))
+        self.assertFalse(response_events[0]["response_complete"])
+        self.assertEqual(b"data: first\n\n", handler.wfile.getvalue())
+        self.assertTrue(handler.close_connection)
+        response.close.assert_called_once_with()
+
     def test_stream_eof_before_declared_length_is_incomplete(self):
         handler = SimpleNamespace(
             close_connection=False,
@@ -1816,7 +1994,7 @@ class ProxyTests(unittest.TestCase):
 
         with mock.patch.object(
             monitor.requests, "Session", return_value=session_context
-        ):
+        ), mock.patch.object(proxy_config, "handle_failure", return_value=True) as handle_failure:
             proxy._handle_request(handler)
 
         self.assertEqual(2, session.request.call_count)
@@ -1826,7 +2004,8 @@ class ProxyTests(unittest.TestCase):
         )
         handler.send_response.assert_called_once_with(200)
         self.assertEqual(b"{}", handler.wfile.getvalue())
-        self.assertEqual({}, proxy_config.requests_proxies())
+        self.assertTrue(proxy_config.requests_proxies())
+        handle_failure.assert_called_once()
 
     def test_proxy_retries_direct_after_xray_error_response(self):
         pool = monitor.SourcePool(
@@ -1868,7 +2047,7 @@ class ProxyTests(unittest.TestCase):
 
         with mock.patch.object(
             monitor.requests, "Session", return_value=session_context
-        ):
+        ), mock.patch.object(proxy_config, "handle_failure", return_value=True) as handle_failure:
             proxy._handle_request(handler)
 
         self.assertEqual(2, session.request.call_count)
@@ -1878,8 +2057,11 @@ class ProxyTests(unittest.TestCase):
         )
         handler.send_response.assert_called_once_with(200)
         self.assertEqual(b"{}", handler.wfile.getvalue())
-        self.assertEqual({}, proxy_config.requests_proxies())
+        self.assertTrue(proxy_config.requests_proxies())
         proxy_response.close.assert_called_once_with()
+        handle_failure.assert_called_once_with(
+            reason="代理返回错误", target="https://example.invalid/v1/responses"
+        )
 
     def test_managed_xray_process_is_started_and_stopped(self):
         proxy_config = monitor.ProxyConfig(url=self.VLESS_LINK, xray="xray")
@@ -1907,6 +2089,54 @@ class ProxyTests(unittest.TestCase):
             proxy_config.stop()
 
         self.assertTrue(process.terminate.called)
+
+    def test_managed_xray_process_output_is_written_to_proxy_events(self):
+        proxy_config = monitor.ProxyConfig(url=self.VLESS_LINK, xray="xray")
+        events = []
+        proxy_config.set_event_logger(
+            lambda event, **fields: events.append((event, fields))
+        )
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.stdout = io.BytesIO(b"[Warning] outbound connection failed\n")
+        probe = mock.MagicMock()
+        probe.__enter__.return_value = probe
+        probe.getsockname.return_value = ("127.0.0.1", 18080)
+        ready = mock.MagicMock()
+        ready.__enter__.return_value = ready
+        config_fd = os.open(os.devnull, os.O_RDONLY)
+
+        with mock.patch(
+            "rawchat.config.shutil.which", return_value="/usr/bin/xray"
+        ), mock.patch(
+            "rawchat.config.socket.socket", return_value=probe
+        ), mock.patch(
+            "rawchat.config.socket.create_connection", return_value=ready
+        ), mock.patch(
+            "rawchat.config.subprocess.Popen", return_value=process
+        ) as popen, mock.patch(
+            "rawchat.config.tempfile.mkstemp",
+            return_value=(config_fd, "test/tmp/xray-output-config.json"),
+        ):
+            Path("test/tmp/xray-output-config.json").write_text("{}")
+            proxy_config.start()
+            proxy_config.stop()
+
+        popen.assert_called_once()
+        self.assertEqual(
+            subprocess.PIPE, popen.call_args.kwargs["stdout"]
+        )
+        self.assertEqual(
+            subprocess.STDOUT, popen.call_args.kwargs["stderr"]
+        )
+        process_events = [
+            fields for event, fields in events if event == "proxy_process_log"
+        ]
+        self.assertEqual(1, len(process_events))
+        self.assertEqual("xray", process_events[0]["stream"])
+        self.assertEqual(
+            "[Warning] outbound connection failed", process_events[0]["message"]
+        )
 
 
 class DashboardProxyStatusTests(unittest.TestCase):
@@ -2044,14 +2274,18 @@ class ClientTests(unittest.TestCase):
         proxy = monitor.ProxyConfig(socks="127.0.0.1:1080")
         client = monitor.RawChatClient(session=session, proxy=proxy)
 
-        self.assertEqual("key", client.fetch_codex()["apiKey"])
+        with mock.patch.object(proxy, "handle_failure", return_value=True) as handle_failure:
+            self.assertEqual("key", client.fetch_codex()["apiKey"])
         self.assertEqual(2, session.get.call_count)
         self.assertEqual(
             {"http": None, "https": None},
             session.get.call_args.kwargs["proxies"],
         )
-        self.assertEqual({}, proxy.requests_proxies())
+        self.assertTrue(proxy.requests_proxies())
         proxy_response.close.assert_called_once_with()
+        handle_failure.assert_called_once_with(
+            reason="代理返回错误", target=monitor.QUOTA_URL
+        )
         client.close()
 
     def test_fetch_codex_returns_only_codex(self):
@@ -3625,6 +3859,47 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual({}, proxy.requests_proxies())
             self.assertIn("直连", proxy.status_text())
+            runtime.proxy.stop()
+
+    def test_runtime_logs_proxy_configuration_failure(self):
+        with tempfile.TemporaryDirectory(dir="test") as temp_dir, mock.patch.object(
+            runtime_module, "LOG_DIR", temp_dir
+        ):
+            args = SimpleNamespace(
+                proxy_port=15872,
+                upstream_url="http://127.0.0.1:1",
+                key_cache=str(Path(temp_dir) / "keys.json"),
+                codex_config=str(Path(temp_dir) / "config.toml"),
+                accounts_file="test/accounts.toml",
+                apply_codex_config=False,
+            )
+            proxy = monitor.ProxyConfig(socks="127.0.0.1:1080")
+            with mock.patch.object(
+                runtime_module,
+                "load_accounts",
+                return_value=[{"email": "one@example.com", "password": "secret"}],
+            ), mock.patch.object(
+                runtime_module, "load_proxy_config", return_value=proxy
+            ), mock.patch.object(
+                runtime_module,
+                "_require_socks",
+                side_effect=RuntimeError("PySocks missing"),
+            ):
+                runtime = monitor.build_runtime(args)
+
+            paths = list(Path(temp_dir).glob("rawchat_proxy_*.jsonl"))
+            self.assertEqual(1, len(paths))
+            events = [
+                json.loads(line)
+                for line in paths[0].read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertTrue(
+                any(
+                    event["event"] == "proxy_failure_detected"
+                    and event["reason"] == "PySocks 未安装"
+                    for event in events
+                )
+            )
             runtime.proxy.stop()
 
     def test_default_worker_factory_passes_configured_proxy_to_clients(self):

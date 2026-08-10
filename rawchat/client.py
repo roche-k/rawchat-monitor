@@ -80,6 +80,7 @@ class RawChatClient:
     ) -> Any:
         proxy_urls = self.proxy.requests_proxies() if self.proxy is not None else {}
         proxy_configured = self.proxy is not None
+        retry_proxies = {"http": None, "https": None}
         for attempt in range(2 if proxy_urls else 1):
             response: requests.Response | None = None
             request_kwargs = dict(kwargs)
@@ -87,7 +88,7 @@ class RawChatClient:
                 request_kwargs["proxies"] = (
                     proxy_urls
                     if attempt == 0 and proxy_urls
-                    else {"http": None, "https": None}
+                    else retry_proxies
                 )
             try:
                 response = getattr(self.session, method)(
@@ -103,7 +104,15 @@ class RawChatClient:
                     )
                 ):
                     response.close()
-                    self.proxy.mark_failed(reason="代理返回错误")
+                    use_direct = self.proxy.handle_failure(
+                        reason="代理返回错误",
+                        target=url,
+                    )
+                    retry_proxies = (
+                        {"http": None, "https": None}
+                        if use_direct
+                        else proxy_urls
+                    )
                     continue
                 response.raise_for_status()
                 envelope = response.json()
@@ -127,7 +136,16 @@ class RawChatClient:
                 raise RawChatError(f"{label}: {exc}") from exc
             except requests.RequestException as exc:
                 if attempt == 0 and proxy_urls and self.proxy is not None:
-                    self.proxy.mark_failed(exc)
+                    use_direct = self.proxy.handle_failure(
+                        exc,
+                        reason="上游连接失败",
+                        target=url,
+                    )
+                    retry_proxies = (
+                        {"http": None, "https": None}
+                        if use_direct
+                        else proxy_urls
+                    )
                     continue
                 raise RawChatError(f"{label}: {exc}") from exc
 

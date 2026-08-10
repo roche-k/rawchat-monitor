@@ -1,5 +1,6 @@
 """Configuration loading and shared runtime constants."""
 
+import io
 import json
 import os
 import shutil
@@ -10,8 +11,10 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urlsplit
+
+import requests
 
 try:
     import tomllib
@@ -58,6 +61,8 @@ COLOR_HEADER = 4
 
 XRAY_START_TIMEOUT = 5.0
 XRAY_STOP_TIMEOUT = 1.0
+PROXY_HEALTHCHECK_URL = "https://www.google.com/generate_204"
+PROXY_HEALTHCHECK_TIMEOUT = (5, 10)
 
 
 def _query_value(query: dict[str, str], *names: str, default: str = "") -> str:
@@ -310,6 +315,15 @@ class ProxyConfig:
     _reason: str = field(default="", init=False, repr=False)
     _process: Any = field(default=None, init=False, repr=False)
     _config_path: Path | None = field(default=None, init=False, repr=False)
+    _process_log_thread: threading.Thread | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _event_logger: Callable[..., Any] | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _failure_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
     _lock: threading.RLock = field(
         default_factory=threading.RLock, init=False, repr=False, compare=False
     )
@@ -340,8 +354,78 @@ class ProxyConfig:
 
     def _poll_process_unlocked(self) -> None:
         process = self._process
-        if process is not None and process.poll() is not None and self._state == "active":
+        return_code = process.poll() if process is not None else None
+        if process is not None and return_code is not None and self._state == "active":
+            self._emit_event(
+                "proxy_process_exit",
+                return_code=return_code,
+                proxy_kind=self._proxy_kind_unlocked(),
+            )
             self._fail_unlocked("Xray 进程已退出")
+
+    def set_event_logger(self, logger: Callable[..., Any] | None) -> None:
+        """Attach the structured event sink used by the local proxy server."""
+        with self._lock:
+            self._event_logger = logger
+
+    @staticmethod
+    def _error_message(error: BaseException | None) -> str:
+        if error is None:
+            return ""
+        return str(error)
+
+    def _emit_event(self, event: str, **fields: Any) -> None:
+        logger = self._event_logger
+        if not callable(logger):
+            return
+        try:
+            logger(event, **fields)
+        except Exception:
+            # Proxy diagnostics must never break the request path.
+            return
+
+    def _proxy_kind_unlocked(self) -> str:
+        return "managed_xray" if self.url else "socks5"
+
+    def _read_process_output(self, stream: io.IOBase) -> None:
+        try:
+            while True:
+                line = stream.readline()
+                if not line:
+                    return
+                if isinstance(line, bytes):
+                    message = line.decode("utf-8", "replace")
+                else:
+                    message = str(line)
+                message = message.rstrip("\r\n")
+                if message:
+                    self._emit_event(
+                        "proxy_process_log",
+                        stream="xray",
+                        proxy_kind=self._proxy_kind_unlocked(),
+                        message=message,
+                    )
+        except Exception as exc:
+            self._emit_event(
+                "proxy_process_log_error",
+                stream="xray",
+                proxy_kind=self._proxy_kind_unlocked(),
+                error_type=type(exc).__name__,
+                error_message=self._error_message(exc),
+            )
+
+    def _start_process_log_reader_unlocked(self) -> None:
+        stream = getattr(self._process, "stdout", None)
+        if not isinstance(stream, io.IOBase):
+            return
+        thread = threading.Thread(
+            target=self._read_process_output,
+            args=(stream,),
+            name="rawchat-xray-log",
+            daemon=True,
+        )
+        self._process_log_thread = thread
+        thread.start()
 
     def requests_proxies(self) -> dict[str, str]:
         with self._lock:
@@ -357,20 +441,132 @@ class ProxyConfig:
             url = f"{scheme}://{auth}{self._active_socks}"
             return {"http": url, "https": url}
 
-    def _fail_unlocked(self, reason: str) -> None:
+    def _fail_unlocked(
+        self,
+        reason: str,
+        error: BaseException | None = None,
+    ) -> None:
         self._state = "failed"
         self._reason = reason
         self._active_socks = ""
+        self._emit_event(
+            "proxy_fallback",
+            reason=reason,
+            error_type=type(error).__name__ if error else None,
+            error_message=self._error_message(error),
+            proxy_kind=self._proxy_kind_unlocked(),
+        )
         self._stop_process_unlocked()
 
-    def mark_failed(self, _error: BaseException | None = None, reason: str = "代理连接失败") -> None:
+    def mark_failed(
+        self,
+        _error: BaseException | None = None,
+        reason: str = "代理连接失败",
+    ) -> None:
+        """Force the proxy into direct mode for unrecoverable configuration errors."""
         with self._lock:
             if self._state == "active":
-                self._fail_unlocked(reason)
+                self._emit_event(
+                    "proxy_failure_detected",
+                    reason=reason,
+                    error_type=type(_error).__name__ if _error else None,
+                    error_message=self._error_message(_error),
+                    proxy_kind=self._proxy_kind_unlocked(),
+                )
+                self._fail_unlocked(reason, error=_error)
+
+    def _health_check_proxies(self) -> dict[str, str]:
+        with self._lock:
+            self._poll_process_unlocked()
+            if self._state != "active" or not self._active_socks:
+                return {}
+            return self.requests_proxies()
+
+    def check_health(self) -> bool:
+        """Check a proxy-independent endpoint through the configured proxy."""
+        proxy_urls = self._health_check_proxies()
+        if not proxy_urls:
+            return False
+        response = None
+        try:
+            with requests.Session() as session:
+                session.trust_env = False
+                response = session.get(
+                    PROXY_HEALTHCHECK_URL,
+                    proxies=proxy_urls,
+                    timeout=PROXY_HEALTHCHECK_TIMEOUT,
+                    allow_redirects=False,
+                )
+                status = response.status_code
+                healthy = status == 204
+                self._emit_event(
+                    "proxy_health_check",
+                    url=PROXY_HEALTHCHECK_URL,
+                    status=status,
+                    expected_status=204,
+                    healthy=healthy,
+                    proxy_kind=self._proxy_kind_unlocked(),
+                )
+                return healthy
+        except (OSError, requests.RequestException) as exc:
+            self._emit_event(
+                "proxy_health_check",
+                url=PROXY_HEALTHCHECK_URL,
+                status=None,
+                expected_status=204,
+                healthy=False,
+                error_type=type(exc).__name__,
+                error_message=self._error_message(exc),
+                proxy_kind=self._proxy_kind_unlocked(),
+            )
+            return False
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+    def handle_failure(
+        self,
+        error: BaseException | None = None,
+        *,
+        reason: str = "代理连接失败",
+        target: str | None = None,
+    ) -> bool:
+        """Return whether the caller should retry directly after a proxy error."""
+        with self._failure_lock:
+            with self._lock:
+                self._poll_process_unlocked()
+                if self._state != "active" or not self._active_socks:
+                    return True
+                proxy_kind = self._proxy_kind_unlocked()
+            self._emit_event(
+                "proxy_failure_detected",
+                reason=reason,
+                error_type=type(error).__name__ if error else None,
+                error_message=self._error_message(error),
+                proxy_kind=proxy_kind,
+                target=target,
+            )
+            if self.check_health():
+                self._emit_event(
+                    "proxy_failure_recovered",
+                    reason=reason,
+                    proxy_kind=proxy_kind,
+                    target=target,
+                )
+                return False
+            with self._lock:
+                if self._state == "active":
+                    self._fail_unlocked(reason, error=error)
+            return True
 
     def _stop_process_unlocked(self) -> None:
         process = self._process
         self._process = None
+        log_thread = self._process_log_thread
+        self._process_log_thread = None
         if process is not None:
             try:
                 if process.poll() is None:
@@ -382,6 +578,8 @@ class ProxyConfig:
                     process.wait(timeout=XRAY_STOP_TIMEOUT)
                 except (OSError, subprocess.TimeoutExpired):
                     pass
+        if log_thread is not None and log_thread is not threading.current_thread():
+            log_thread.join(timeout=XRAY_STOP_TIMEOUT)
         if self._config_path is not None:
             try:
                 self._config_path.unlink()
@@ -421,9 +619,16 @@ class ProxyConfig:
                 self._process = subprocess.Popen(
                     [executable, "run", "-config", str(config_path)],
                     stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     close_fds=True,
+                )
+                self._start_process_log_reader_unlocked()
+                process_id = getattr(self._process, "pid", None)
+                self._emit_event(
+                    "proxy_process_started",
+                    pid=process_id if isinstance(process_id, int) else None,
+                    proxy_kind=self._proxy_kind_unlocked(),
                 )
                 deadline = time.monotonic() + XRAY_START_TIMEOUT
                 while time.monotonic() < deadline:
@@ -438,10 +643,10 @@ class ProxyConfig:
                     except OSError:
                         time.sleep(0.05)
                 self._fail_unlocked("Xray 启动超时")
-            except ValueError:
-                self._fail_unlocked("VLESS 配置无效")
-            except (OSError, subprocess.SubprocessError):
-                self._fail_unlocked("Xray 启动失败")
+            except ValueError as exc:
+                self._fail_unlocked("VLESS 配置无效", error=exc)
+            except (OSError, subprocess.SubprocessError) as exc:
+                self._fail_unlocked("Xray 启动失败", error=exc)
 
     def stop(self) -> None:
         with self._lock:
