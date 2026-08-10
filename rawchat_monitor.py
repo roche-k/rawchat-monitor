@@ -60,6 +60,7 @@ from rawchat.config import (
     UPSTREAM_READ_TIMEOUT,
     WORKER_STOP_TIMEOUT,
     _require_socks,
+    build_xray_config,
     load_accounts,
     load_proxy_config,
     tomllib,
@@ -108,7 +109,7 @@ from rawchat.dashboard import (
     uncached_input_tokens,
     uncached_output_tokens,
 )
-from rawchat.proxy import RawChatProxyServer
+from rawchat.proxy import RawChatProxyServer, _codex_quota_headers
 from rawchat.records import (
     DashboardSnapshot,
     RecordStore,

@@ -33,7 +33,7 @@ from .dashboard import (
     handle_key,
     init_curses,
     layout_for_size,
-    load_proxy_request_total,
+    load_proxy_metrics,
     render_dashboard,
 )
 from .proxy import RawChatProxyServer
@@ -144,7 +144,11 @@ def build_runtime(args: argparse.Namespace) -> MonitorRuntime:
     accounts_path = args.accounts_file or DEFAULT_ACCOUNTS_FILE
     accounts = load_accounts(accounts_path)
     proxy_config = load_proxy_config(accounts_path)
-    _require_socks(proxy_config)
+    if proxy_config is not None:
+        try:
+            _require_socks(proxy_config)
+        except RuntimeError:
+            proxy_config.mark_failed(reason="PySocks 未安装")
     key_cache = ApiKeyCache(args.key_cache)
     cached_keys = {
         account["email"]: key_cache.get(account["email"])
@@ -188,7 +192,11 @@ def default_runtime_factory() -> MonitorRuntime:
 def default_worker_factory() -> RefreshWorker:
     accounts = load_accounts(DEFAULT_ACCOUNTS_FILE)
     proxy_config = load_proxy_config(DEFAULT_ACCOUNTS_FILE)
-    _require_socks(proxy_config)
+    if proxy_config is not None:
+        try:
+            _require_socks(proxy_config)
+        except RuntimeError:
+            proxy_config.mark_failed(reason="PySocks 未安装")
     return RefreshWorker(
         RefreshEngine(MultiAccountClient(accounts, proxy=proxy_config))
     )
@@ -248,11 +256,21 @@ def run_dashboard(
         worker = worker_factory()
     store = RecordStore(log_dir=LOG_DIR)
     started_at = time.monotonic()
+    proxy_request_total, proxy_avg_first_byte_ms, proxy_avg_response_ms = (
+        load_proxy_metrics(LOG_DIR)
+    )
     state = DashboardState(
         next_refresh_at=started_at + REFRESH_INTERVAL,
         all_records=store.all_records(),
         source_pool=runtime.source_pool if runtime is not None else None,
-        proxy_request_total=load_proxy_request_total(LOG_DIR),
+        proxy_request_total=proxy_request_total,
+        proxy_avg_first_byte_ms=proxy_avg_first_byte_ms,
+        proxy_avg_response_ms=proxy_avg_response_ms,
+        proxy_config=(
+            getattr(runtime.proxy, "proxy", None)
+            if runtime is not None
+            else None
+        ),
     )
     if runtime is not None:
         state.refreshing = runtime.start()

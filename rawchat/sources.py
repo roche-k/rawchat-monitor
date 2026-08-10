@@ -83,6 +83,8 @@ class SourceState:
     reason: str | None = None
     refresh_error: str | None = None
     release_at: datetime | None = None
+    rolling_limit: dict[str, Any] | None = None
+    rolling_fetched_at: datetime | None = None
 
     @property
     def status(self) -> str:
@@ -144,6 +146,28 @@ class SourcePool:
                 if source.email == email:
                     source.api_key = key
                     return
+
+    def set_rolling_snapshot(
+        self,
+        email: str,
+        rolling: dict[str, Any],
+        fetched_at: datetime,
+    ) -> None:
+        with self._lock:
+            for source in self._sources:
+                if source.email == email:
+                    source.rolling_limit = dict(rolling)
+                    source.rolling_fetched_at = fetched_at
+                    return
+
+    def get_rolling_snapshot(
+        self, email: str
+    ) -> tuple[dict[str, Any] | None, datetime | None]:
+        with self._lock:
+            for source in self._sources:
+                if source.email == email:
+                    return source.rolling_limit, source.rolling_fetched_at
+        return None, None
 
     def update_quota(
         self,

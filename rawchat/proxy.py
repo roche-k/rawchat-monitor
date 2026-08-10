@@ -13,11 +13,12 @@ import requests
 from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
 from .config import (
+    REFRESH_INTERVAL,
     UPSTREAM_CONNECT_TIMEOUT,
     UPSTREAM_READ_TIMEOUT,
     ProxyConfig,
 )
-from .records import _log_date, _number
+from .records import _log_date, _number, _parse_datetime
 from .sources import (
     SourcePool,
     SourceState,
@@ -37,6 +38,51 @@ _HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+
+
+def _codex_quota_headers(rolling: Any, now: Any = datetime.now) -> dict[str, str]:
+    """将 RawChat rolling 快照转换为 Codex 额度头，缺失/非法时返回空 dict。
+
+    成功注入头：
+      x-codex-primary-used-percent
+      x-codex-primary-window-minutes  始终 300
+      x-codex-primary-reset-at        仅当 releaseAt 是有效未来时间
+    """
+    if not isinstance(rolling, dict):
+        return {}
+    if rolling.get("enabled") is not True:
+        return {}
+    window = rolling.get("window")
+    if not isinstance(window, dict):
+        return {}
+    limit_usd = _number(window.get("limitUsd"))
+    if limit_usd is None or limit_usd <= 0:
+        return {}
+    remaining = _number(window.get("remainingUsd"))
+    if remaining is None:
+        return {}
+    if remaining < 0:
+        used_percent = 100.0
+    elif remaining > limit_usd:
+        used_percent = 0.0
+    else:
+        used_percent = max(
+            0.0,
+            min(100.0, (1.0 - remaining / limit_usd) * 100.0),
+        )
+    used_percent = round(used_percent, 2)
+    headers = {
+        "x-codex-primary-used-percent": f"{used_percent:.2f}",
+        "x-codex-primary-window-minutes": "300",
+    }
+    release_str = window.get("releaseAt")
+    if isinstance(release_str, str) and release_str:
+        release_at = _parse_datetime(release_str)
+        if release_at is not None and release_at > now():
+            headers["x-codex-primary-reset-at"] = str(
+                int(release_at.timestamp())
+            )
+    return headers
 
 
 class RawChatProxyServer:
@@ -118,6 +164,10 @@ class RawChatProxyServer:
             raise RuntimeError("代理已经启动过")
         self._started = True
         try:
+            if self.proxy is not None:
+                start_proxy = getattr(self.proxy, "start", None)
+                if callable(start_proxy):
+                    start_proxy()
             server = http.server.ThreadingHTTPServer(
                 (self.host, self.port), self._handler_class
             )
@@ -137,12 +187,20 @@ class RawChatProxyServer:
                 self._server.server_close()
                 self._server = None
             self._thread = None
+            if self.proxy is not None:
+                stop_proxy = getattr(self.proxy, "stop", None)
+                if callable(stop_proxy):
+                    stop_proxy()
             raise
 
     def stop(self) -> None:
         server = self._server
         thread = self._thread
         if server is None:
+            if self.proxy is not None:
+                stop_proxy = getattr(self.proxy, "stop", None)
+                if callable(stop_proxy):
+                    stop_proxy()
             return
         server.shutdown()
         server.server_close()
@@ -150,6 +208,10 @@ class RawChatProxyServer:
             thread.join(timeout=1.0)
         self._server = None
         self._thread = None
+        if self.proxy is not None:
+            stop_proxy = getattr(self.proxy, "stop", None)
+            if callable(stop_proxy):
+                stop_proxy()
 
     @staticmethod
     def _request_body(handler: http.server.BaseHTTPRequestHandler) -> bytes | None:
@@ -338,6 +400,23 @@ class RawChatProxyServer:
             return {}
         return {"model": model}
 
+    def _inject_codex_quota_headers(
+        self,
+        response: requests.Response,
+        email: str,
+    ) -> None:
+        rolling, fetched_at = self.source_pool.get_rolling_snapshot(email)
+        if rolling is None or fetched_at is None:
+            return
+        age = datetime.now() - fetched_at
+        if age.total_seconds() > REFRESH_INTERVAL:
+            return
+        headers = _codex_quota_headers(rolling)
+        if not headers:
+            return
+        for name, value in headers.items():
+            response.headers[name] = value
+
     def _handle_request(
         self, handler: http.server.BaseHTTPRequestHandler
     ) -> None:
@@ -389,23 +468,78 @@ class RawChatProxyServer:
             headers = self._forward_headers(handler, source, body)
             url = f"{self.upstream_base_url}{handler.path}"
             started_at = time.monotonic()
+            proxy_urls = (
+                self.proxy.requests_proxies() if self.proxy is not None else {}
+            )
+            proxy_active = bool(proxy_urls)
             proxies = (
-                self.proxy.requests_proxies() if self.proxy is not None else None
+                proxy_urls
+                if proxy_active
+                else {"http": None, "https": None}
+                if self.proxy is not None
+                else None
             )
             try:
                 with requests.Session() as session:
-                    response = session.request(
-                        handler.command,
-                        url,
-                        headers=headers,
-                        data=body,
-                        stream=True,
-                        proxies=proxies,
-                        timeout=(
-                            UPSTREAM_CONNECT_TIMEOUT,
-                            UPSTREAM_READ_TIMEOUT,
-                        ),
-                    )
+                    try:
+                        response = session.request(
+                            handler.command,
+                            url,
+                            headers=headers,
+                            data=body,
+                            stream=True,
+                            proxies=proxies,
+                            timeout=(
+                                UPSTREAM_CONNECT_TIMEOUT,
+                                UPSTREAM_READ_TIMEOUT,
+                            ),
+                        )
+                    except (OSError, requests.RequestException) as exc:
+                        if not proxy_active or self.proxy is None:
+                            raise
+                        mark_failed = getattr(self.proxy, "mark_failed", None)
+                        if callable(mark_failed):
+                            mark_failed(exc)
+                        response = session.request(
+                            handler.command,
+                            url,
+                            headers=headers,
+                            data=body,
+                            stream=True,
+                            proxies={"http": None, "https": None},
+                            timeout=(
+                                UPSTREAM_CONNECT_TIMEOUT,
+                                UPSTREAM_READ_TIMEOUT,
+                            ),
+                        )
+                    if (
+                        proxy_active
+                        and response.status_code in {502, 503, 504}
+                        and any(
+                            str(name).lower() == "proxy-connection"
+                            for name in response.headers
+                        )
+                    ):
+                        try:
+                            response.close()
+                        except Exception:
+                            handler.close_connection = True
+                        mark_failed = getattr(self.proxy, "mark_failed", None)
+                        if callable(mark_failed):
+                            mark_failed(reason="代理返回错误")
+                        response = session.request(
+                            handler.command,
+                            url,
+                            headers=headers,
+                            data=body,
+                            stream=True,
+                            proxies={"http": None, "https": None},
+                            timeout=(
+                                UPSTREAM_CONNECT_TIMEOUT,
+                                UPSTREAM_READ_TIMEOUT,
+                            ),
+                        )
+                        proxy_active = False
                     first_byte_at = time.monotonic()
                     quota_candidate = response.status_code in {402, 403, 429}
                     error_body = b""
@@ -515,6 +649,7 @@ class RawChatProxyServer:
 
                     if 200 <= response.status_code < 400:
                         self.source_pool.mark_success(source.email)
+                        self._inject_codex_quota_headers(response, source.email)
                     response_finished_at, response_complete = self._send_stream(
                         handler, response
                     )

@@ -249,6 +249,9 @@ class DashboardState:
     record_lines: list[str] = field(default_factory=list)
     token_buckets: list[tuple[datetime, float]] = field(default_factory=list)
     proxy_request_total: int = 0
+    proxy_avg_first_byte_ms: float | None = None
+    proxy_avg_response_ms: float | None = None
+    proxy_config: Any = None
 
     def __post_init__(self) -> None:
         refresh_dashboard_data(self)
@@ -354,10 +357,25 @@ def load_proxy_request_total(
     log_dir: str | Path,
     now: datetime | None = None,
 ) -> int:
+    """当天代理请求总数（兼容旧接口）。"""
+    return load_proxy_metrics(log_dir, now)[0]
+
+
+def load_proxy_metrics(
+    log_dir: str | Path,
+    now: datetime | None = None,
+) -> tuple[int, float | None, float | None]:
+    """聚合当天代理事件日志，返回 (请求总数, 首字延迟均值ms, 响应延迟均值ms)。
+
+    延迟来自本地代理实测的 upstream_response 事件（first_byte_time_ms /
+    response_time_ms），仅统计完整转发的响应。
+    """
     path = Path(log_dir) / (
         f"rawchat_proxy_{_log_date(now or datetime.now())}.jsonl"
     )
     total = 0
+    first_byte_values: list[float] = []
+    response_values: list[float] = []
     try:
         with path.open(encoding="utf-8") as handle:
             for line in handle:
@@ -365,16 +383,38 @@ def load_proxy_request_total(
                     event = json.loads(line)
                 except (json.JSONDecodeError, TypeError):
                     continue
-                if isinstance(event, dict) and event.get("event") == "request_received":
+                if not isinstance(event, dict):
+                    continue
+                if event.get("event") == "request_received":
                     total += 1
+                    continue
+                if event.get("event") != "upstream_response":
+                    continue
+                if event.get("response_complete") is not True:
+                    continue
+                first_byte = _number(event.get("first_byte_time_ms"))
+                response = _number(event.get("response_time_ms"))
+                if first_byte is not None:
+                    first_byte_values.append(first_byte)
+                if response is not None:
+                    response_values.append(response)
     except OSError:
-        return 0
-    return total
+        return 0, None, None
+    avg_first_byte = (
+        sum(first_byte_values) / len(first_byte_values)
+        if first_byte_values
+        else None
+    )
+    avg_response = (
+        sum(response_values) / len(response_values) if response_values else None
+    )
+    return total, avg_first_byte, avg_response
 
 
 def refresh_dashboard_data(
     state: DashboardState,
     proxy_request_total: int | None = None,
+    proxy_metrics: tuple[float | None, float | None] | None = None,
 ) -> None:
     """Build backend-derived dashboard data outside the rendering path."""
     records = state.all_records if state.all_records else _records(state.snapshot)
@@ -393,6 +433,10 @@ def refresh_dashboard_data(
             state.unassigned_record_count += 1
     if proxy_request_total is not None:
         state.proxy_request_total = max(0, int(proxy_request_total))
+    if proxy_metrics is not None:
+        avg_first_byte, avg_response = proxy_metrics
+        state.proxy_avg_first_byte_ms = avg_first_byte
+        state.proxy_avg_response_ms = avg_response
 
 
 def render_token_chart(
@@ -493,9 +537,11 @@ def apply_outcome(
         state.all_records = store.all_records()
     else:
         state.all_records = list(_records(state.snapshot))
+    request_total, avg_first_byte, avg_response = load_proxy_metrics(LOG_DIR)
     refresh_dashboard_data(
         state,
-        proxy_request_total=load_proxy_request_total(LOG_DIR),
+        proxy_request_total=request_total,
+        proxy_metrics=(avg_first_byte, avg_response),
     )
 
     new_records = _records(state.snapshot)
@@ -665,12 +711,17 @@ def build_summary_lines(
         else "-"
     )
     countdown = max(0, int(state.next_refresh_at - monotonic_now))
+    proxy_status = (
+        state.proxy_config.status_text()
+        if state.proxy_config is not None
+        else "代理未配置 | 当前直连"
+    )
 
     per_account = snapshot.per_account if snapshot else []
     if not per_account:
         total_records = len(state.all_records) if state.all_records else len(records)
         return [
-            f"{connection} | 上次 {last_success} | 下次 {countdown}s | "
+            f"{connection} | {proxy_status} | 上次 {last_success} | 下次 {countdown}s | "
             f"记录 {total_records} (当天)"
         ]
 
@@ -686,7 +737,7 @@ def build_summary_lines(
         if total == 1 and account_count == 0:
             account_count = state.unassigned_record_count
         lines.append(
-            f"{connection} | 账号 {index + 1}/{total} | {account['email']} | "
+            f"{connection} | {proxy_status} | 账号 {index + 1}/{total} | {account['email']} | "
             f"上次 {last_success} | 下次 {countdown}s | "
             f"记录 {account_count} (当天) | "
             f"滚动窗口 {rolling} | 余额 {balance} | 套餐 {subscriptions}"
@@ -709,6 +760,23 @@ def build_stats_lines(state: DashboardState, max_width: int) -> list[str]:
         f"总金额 {fmt_cost(stats['total_cost'])} | "
         f"代理请求 {state.proxy_request_total}"
     )
+    if (
+        state.proxy_avg_first_byte_ms is not None
+        or state.proxy_avg_response_ms is not None
+    ):
+        first_byte_text = (
+            f"{state.proxy_avg_first_byte_ms / 1000:.2f}s"
+            if state.proxy_avg_first_byte_ms is not None
+            else "-"
+        )
+        response_text = (
+            f"{state.proxy_avg_response_ms / 1000:.2f}s"
+            if state.proxy_avg_response_ms is not None
+            else "-"
+        )
+        token_line += (
+            f" | 代理首字均 {first_byte_text} | 代理响应均 {response_text}"
+        )
     lines = [token_line]
     ip_items = sorted(
         stats["by_ip"].items(),

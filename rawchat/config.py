@@ -1,9 +1,17 @@
 """Configuration loading and shared runtime constants."""
 
+import json
 import os
-from dataclasses import dataclass
+import shutil
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import quote
+from typing import Any
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 try:
     import tomllib
@@ -48,20 +56,409 @@ COLOR_WARNING = 3
 COLOR_HEADER = 4
 
 
-@dataclass(frozen=True)
+XRAY_START_TIMEOUT = 5.0
+XRAY_STOP_TIMEOUT = 1.0
+
+
+def _query_value(query: dict[str, str], *names: str, default: str = "") -> str:
+    for name in names:
+        value = query.get(name)
+        if value is not None:
+            return value
+    return default
+
+
+def _query_bool(query: dict[str, str], *names: str, default: bool = False) -> bool:
+    value = _query_value(query, *names)
+    if not value:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _query_int(query: dict[str, str], name: str) -> int | None:
+    value = query.get(name)
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"VLESS 参数 {name} 必须是整数") from exc
+
+
+def _split_list(value: str) -> list[str]:
+    return [item.strip() for item in value.replace("|", ",").split(",") if item.strip()]
+
+
+def _parse_vless_query(url: str) -> tuple[str, int, str, dict[str, str]]:
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() != "vless":
+            raise ValueError("VLESS 链接必须使用 vless:// scheme")
+        host = parsed.hostname
+        port = parsed.port
+        uuid = unquote(parsed.username or "")
+    except ValueError as exc:
+        raise ValueError(f"VLESS 链接格式无效: {exc}") from exc
+    if not host or port is None or not uuid:
+        raise ValueError("VLESS 链接缺少 UUID、地址或端口")
+    values = parse_qs(parsed.query, keep_blank_values=True)
+    query = {key: unquote(items[-1]) for key, items in values.items()}
+    return host, port, uuid, query
+
+
+def build_xray_config(url: str, socks_port: int) -> dict[str, Any]:
+    """Convert a VLESS share link into an Xray SOCKS-inbound config."""
+    host, port, uuid, query = _parse_vless_query(url)
+    security = _query_value(query, "security", default="none").lower()
+    network = _query_value(query, "type", "network", default="tcp").lower()
+    network = {"splithttp": "xhttp", "httpupgrade": "httpupgrade"}.get(
+        network, network
+    )
+    if security not in {"none", "tls", "reality"}:
+        raise ValueError(f"VLESS security 不支持: {security}")
+    if network not in {
+        "tcp",
+        "raw",
+        "ws",
+        "grpc",
+        "http",
+        "h2",
+        "httpupgrade",
+        "xhttp",
+        "kcp",
+        "mkcp",
+        "quic",
+    }:
+        raise ValueError(f"VLESS 传输类型不支持: {network}")
+
+    user: dict[str, Any] = {
+        "id": uuid,
+        "encryption": _query_value(query, "encryption", default="none"),
+    }
+    if query.get("flow"):
+        user["flow"] = query["flow"]
+    level = _query_int(query, "level")
+    if level is not None:
+        user["level"] = level
+
+    stream: dict[str, Any] = {
+        "network": "tcp" if network == "raw" else network,
+        "security": security,
+    }
+    if security == "tls":
+        tls: dict[str, Any] = {
+            "serverName": _query_value(query, "sni", "serverName", default=host),
+            "allowInsecure": _query_bool(
+                query, "allowInsecure", "insecure", default=False
+            ),
+        }
+        if query.get("alpn"):
+            tls["alpn"] = _split_list(query["alpn"])
+        fingerprint = _query_value(query, "fp", "fingerprint")
+        if fingerprint:
+            tls["fingerprint"] = fingerprint
+        for source, target in (
+            ("echConfigList", "echConfigList"),
+            ("echForceQuery", "echForceQuery"),
+            ("pinnedPeerCertSha256", "pinnedPeerCertSha256"),
+        ):
+            if query.get(source):
+                tls[target] = query[source]
+        stream["tlsSettings"] = tls
+    elif security == "reality":
+        reality: dict[str, Any] = {
+            "serverName": _query_value(query, "sni", "serverName", default=host),
+            "fingerprint": _query_value(query, "fp", "fingerprint", default="chrome"),
+            "publicKey": _query_value(query, "pbk", "publicKey"),
+            "shortId": _query_value(query, "sid", "shortId"),
+        }
+        spider = _query_value(query, "spx", "spiderX")
+        if spider:
+            reality["spiderX"] = spider
+        if query.get("mldsa65Verify"):
+            reality["mldsa65Verify"] = query["mldsa65Verify"]
+        stream["realitySettings"] = reality
+
+    if stream["network"] == "tcp":
+        header_type = _query_value(query, "headerType", default="none")
+        if header_type != "none":
+            header: dict[str, Any] = {"type": header_type}
+            if query.get("host"):
+                header["request"] = {"headers": {"Host": _split_list(query["host"])}}
+            if query.get("path"):
+                header.setdefault("request", {})["path"] = _split_list(query["path"])
+            stream["tcpSettings"] = {"header": header}
+    elif stream["network"] == "ws":
+        ws: dict[str, Any] = {"path": _query_value(query, "path", default="/")}
+        ws_host = _query_value(query, "host", "authority")
+        if ws_host:
+            ws["headers"] = {"Host": ws_host}
+        early_data = _query_int(query, "ed")
+        if early_data is not None:
+            ws["maxEarlyData"] = early_data
+        early_header = _query_value(query, "eh")
+        if early_header:
+            ws["earlyDataHeaderName"] = early_header
+        stream["wsSettings"] = ws
+    elif stream["network"] == "grpc":
+        grpc: dict[str, Any] = {
+            "serviceName": _query_value(query, "serviceName", default=""),
+            "authority": _query_value(query, "authority", "host"),
+        }
+        grpc["multiMode"] = _query_value(query, "mode").lower() == "multi"
+        stream["grpcSettings"] = grpc
+    elif stream["network"] in {"http", "h2"}:
+        http_settings: dict[str, Any] = {
+            "path": _query_value(query, "path", default="/"),
+            "host": _split_list(_query_value(query, "host", "authority")),
+        }
+        stream["httpSettings"] = http_settings
+    elif stream["network"] == "httpupgrade":
+        stream["httpupgradeSettings"] = {
+            "path": _query_value(query, "path", default="/"),
+            "host": _query_value(query, "host", "authority"),
+        }
+    elif stream["network"] == "xhttp":
+        xhttp: dict[str, Any] = {
+            "path": _query_value(query, "path", default="/"),
+            "host": _query_value(query, "host", "authority"),
+            "mode": _query_value(query, "mode", default="auto"),
+        }
+        if query.get("extra"):
+            try:
+                extra = json.loads(query["extra"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("VLESS xhttp extra 参数不是有效 JSON") from exc
+            if not isinstance(extra, dict):
+                raise ValueError("VLESS xhttp extra 参数必须是 JSON 对象")
+            xhttp.update(extra)
+        stream["xhttpSettings"] = xhttp
+    elif stream["network"] in {"kcp", "mkcp"}:
+        kcp: dict[str, Any] = {}
+        for name in (
+            "mtu",
+            "tti",
+            "uplinkCapacity",
+            "downlinkCapacity",
+            "congestion",
+            "readBufferSize",
+            "writeBufferSize",
+        ):
+            value = _query_int(query, name)
+            if value is not None:
+                kcp[name] = value
+        header_type = _query_value(query, "headerType", default="none")
+        kcp["header"] = {"type": header_type}
+        if query.get("seed"):
+            kcp["seed"] = query["seed"]
+        stream["kcpSettings"] = kcp
+    elif stream["network"] == "quic":
+        stream["quicSettings"] = {
+            "security": _query_value(query, "quicSecurity", "security", default="none"),
+            "key": _query_value(query, "key"),
+            "header": {"type": _query_value(query, "headerType", default="none")},
+        }
+
+    settings: dict[str, Any] = {
+        "vnext": [
+            {
+                "address": host,
+                "port": port,
+                "users": [user],
+            }
+        ]
+    }
+    packet_encoding = _query_value(query, "packetEncoding")
+    if packet_encoding:
+        settings["packetEncoding"] = packet_encoding
+    outbound: dict[str, Any] = {
+        "protocol": "vless",
+        "settings": settings,
+        "streamSettings": stream,
+    }
+    if _query_bool(query, "mux", default=False):
+        mux: dict[str, Any] = {"enabled": True}
+        concurrency = _query_int(query, "muxConcurrency")
+        if concurrency is not None:
+            mux["concurrency"] = concurrency
+        outbound["mux"] = mux
+
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [
+            {
+                "listen": "127.0.0.1",
+                "port": socks_port,
+                "protocol": "http",
+                "settings": {},
+            }
+        ],
+        "outbounds": [outbound, {"protocol": "freedom", "tag": "direct"}],
+    }
+
+
+@dataclass
 class ProxyConfig:
-    socks: str
+    socks: str = ""
     username: str = ""
     password: str = ""
+    url: str = ""
+    xray: str = ""
+    config_error: str = ""
+    _active_socks: str = field(default="", init=False, repr=False)
+    _state: str = field(default="", init=False, repr=False)
+    _reason: str = field(default="", init=False, repr=False)
+    _process: Any = field(default=None, init=False, repr=False)
+    _config_path: Path | None = field(default=None, init=False, repr=False)
+    _lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        if self.socks and self.url:
+            self.config_error = "代理配置同时包含 socks 和 url"
+        if self.config_error:
+            self._state = "failed"
+            self._reason = self.config_error
+        elif self.socks:
+            self._active_socks = self.socks
+            self._state = "active"
+        elif self.url:
+            self._state = "inactive"
+        else:
+            self._state = "inactive"
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.socks or self.url or self.config_error)
+
+    @property
+    def using(self) -> bool:
+        with self._lock:
+            self._poll_process_unlocked()
+            return self._state == "active" and bool(self._active_socks)
+
+    def _poll_process_unlocked(self) -> None:
+        process = self._process
+        if process is not None and process.poll() is not None and self._state == "active":
+            self._fail_unlocked("Xray 进程已退出")
 
     def requests_proxies(self) -> dict[str, str]:
-        auth = (
-            f"{quote(self.username, safe='')}:{quote(self.password, safe='')}@"
-            if self.username
-            else ""
-        )
-        url = f"socks5://{auth}{self.socks}"
-        return {"http": url, "https": url}
+        with self._lock:
+            self._poll_process_unlocked()
+            if self._state != "active" or not self._active_socks:
+                return {}
+            auth = (
+                f"{quote(self.username, safe='')}:{quote(self.password, safe='')}@"
+                if self.username
+                else ""
+            )
+            scheme = "http" if self.url else "socks5"
+            url = f"{scheme}://{auth}{self._active_socks}"
+            return {"http": url, "https": url}
+
+    def _fail_unlocked(self, reason: str) -> None:
+        self._state = "failed"
+        self._reason = reason
+        self._active_socks = ""
+        self._stop_process_unlocked()
+
+    def mark_failed(self, _error: BaseException | None = None, reason: str = "代理连接失败") -> None:
+        with self._lock:
+            if self._state == "active":
+                self._fail_unlocked(reason)
+
+    def _stop_process_unlocked(self) -> None:
+        process = self._process
+        self._process = None
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=XRAY_STOP_TIMEOUT)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process.kill()
+                    process.wait(timeout=XRAY_STOP_TIMEOUT)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        if self._config_path is not None:
+            try:
+                self._config_path.unlink()
+            except OSError:
+                pass
+            self._config_path = None
+
+    def start(self) -> None:
+        with self._lock:
+            if not self.configured or self._state in {"active", "failed"}:
+                return
+            if self.config_error:
+                return
+            if self.socks:
+                self._active_socks = self.socks
+                self._state = "active"
+                return
+            executable = shutil.which(self.xray or "xray")
+            if not executable:
+                self._fail_unlocked("Xray 未找到")
+                return
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    probe.bind(("127.0.0.1", 0))
+                    port = int(probe.getsockname()[1])
+                config_fd, config_name = tempfile.mkstemp(
+                    prefix="rawchat-xray-", suffix=".json"
+                )
+                os.close(config_fd)
+                config_path = Path(config_name)
+                self._config_path = config_path
+                config_path.write_text(
+                    json.dumps(build_xray_config(self.url, port), ensure_ascii=True),
+                    encoding="utf-8",
+                )
+                os.chmod(config_path, 0o600)
+                self._process = subprocess.Popen(
+                    [executable, "run", "-config", str(config_path)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                )
+                deadline = time.monotonic() + XRAY_START_TIMEOUT
+                while time.monotonic() < deadline:
+                    if self._process.poll() is not None:
+                        self._fail_unlocked("Xray 启动失败")
+                        return
+                    try:
+                        with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                            self._active_socks = f"127.0.0.1:{port}"
+                            self._state = "active"
+                            return
+                    except OSError:
+                        time.sleep(0.05)
+                self._fail_unlocked("Xray 启动超时")
+            except ValueError:
+                self._fail_unlocked("VLESS 配置无效")
+            except (OSError, subprocess.SubprocessError):
+                self._fail_unlocked("Xray 启动失败")
+
+    def stop(self) -> None:
+        with self._lock:
+            self._active_socks = ""
+            self._state = "inactive"
+            self._stop_process_unlocked()
+
+    def status_text(self) -> str:
+        with self._lock:
+            self._poll_process_unlocked()
+            if not self.configured:
+                return "代理未配置 | 当前直连"
+            if self._state == "active":
+                return "代理使用中 | 当前代理"
+            if self._reason:
+                return f"代理失效 | 当前直连 | {self._reason}"
+            return "代理未启用 | 当前直连"
 
 
 def load_accounts(path: str | os.PathLike[str]) -> list[dict[str, str]]:
@@ -97,10 +494,7 @@ def load_accounts(path: str | os.PathLike[str]) -> list[dict[str, str]]:
 
 
 def load_proxy_config(path: str | os.PathLike[str]) -> ProxyConfig | None:
-    """Load the optional [proxy] SOCKS5 configuration from the TOML file.
-
-    Returns None when the table is absent or socks is empty (direct connection).
-    """
+    """Load the optional external SOCKS5 or managed VLESS configuration."""
     config_path = Path(path).expanduser()
     if not config_path.is_file():
         raise ValueError(f"账号配置文件不存在: {config_path}")
@@ -111,21 +505,32 @@ def load_proxy_config(path: str | os.PathLike[str]) -> ProxyConfig | None:
     raw = data.get("proxy") if isinstance(data, dict) else None
     if not isinstance(raw, dict):
         return None
-    socks = raw.get("socks")
-    if not isinstance(socks, str) or not socks.strip():
+    socks_value = raw.get("socks")
+    url_value = raw.get("url")
+    xray_value = raw.get("xray")
+    socks = socks_value.strip() if isinstance(socks_value, str) else ""
+    url = url_value.strip() if isinstance(url_value, str) else ""
+    xray = xray_value.strip() if isinstance(xray_value, str) else ""
+    if not socks and not url and not xray:
         return None
+    if socks and url:
+        return ProxyConfig(config_error="代理配置同时包含 socks 和 url")
+    if xray and not url:
+        return ProxyConfig(config_error="xray 配置必须与 url 一起使用")
     username = raw.get("username") or ""
     password = raw.get("password") or ""
     return ProxyConfig(
-        socks=socks.strip(),
+        socks=socks,
         username=str(username).strip(),
         password=str(password),
+        url=url,
+        xray=xray,
     )
 
 
 def _require_socks(proxy: ProxyConfig | None) -> None:
-    """Fail fast when a proxy is configured but PySocks is unavailable."""
-    if proxy is None:
+    """Fail fast when an external SOCKS5 proxy lacks PySocks."""
+    if proxy is None or not proxy.socks:
         return
     try:
         import socks  # noqa: F401

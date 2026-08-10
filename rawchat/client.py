@@ -78,30 +78,58 @@ class RawChatClient:
     def _payload(
         self, method: str, url: str, label: str, **kwargs: Any
     ) -> Any:
-        response: requests.Response | None = None
-        try:
-            response = getattr(self.session, method)(
-                url, timeout=REQUEST_TIMEOUT, **kwargs
-            )
-            response.raise_for_status()
-            envelope = response.json()
-        except requests.HTTPError as exc:
+        proxy_urls = self.proxy.requests_proxies() if self.proxy is not None else {}
+        proxy_configured = self.proxy is not None
+        for attempt in range(2 if proxy_urls else 1):
+            response: requests.Response | None = None
+            request_kwargs = dict(kwargs)
+            if proxy_configured:
+                request_kwargs["proxies"] = (
+                    proxy_urls
+                    if attempt == 0 and proxy_urls
+                    else {"http": None, "https": None}
+                )
             try:
-                body = response.content if response is not None else b""
-            except Exception:
-                body = b""
-            if not isinstance(body, bytes):
-                body = str(body).encode("utf-8", "replace")
-            status_code = (
-                response.status_code
-                if response is not None and isinstance(response.status_code, int)
-                else None
-            )
-            raise RawChatError(
-                f"{label}: {exc}", status_code=status_code, body=body
-            ) from exc
-        except (requests.RequestException, ValueError) as exc:
-            raise RawChatError(f"{label}: {exc}") from exc
+                response = getattr(self.session, method)(
+                    url, timeout=REQUEST_TIMEOUT, **request_kwargs
+                )
+                if (
+                    attempt == 0
+                    and proxy_urls
+                    and response.status_code in {502, 503, 504}
+                    and any(
+                        str(name).lower() == "proxy-connection"
+                        for name in response.headers
+                    )
+                ):
+                    response.close()
+                    self.proxy.mark_failed(reason="代理返回错误")
+                    continue
+                response.raise_for_status()
+                envelope = response.json()
+                break
+            except requests.HTTPError as exc:
+                try:
+                    body = response.content if response is not None else b""
+                except Exception:
+                    body = b""
+                if not isinstance(body, bytes):
+                    body = str(body).encode("utf-8", "replace")
+                status_code = (
+                    response.status_code
+                    if response is not None and isinstance(response.status_code, int)
+                    else None
+                )
+                raise RawChatError(
+                    f"{label}: {exc}", status_code=status_code, body=body
+                ) from exc
+            except ValueError as exc:
+                raise RawChatError(f"{label}: {exc}") from exc
+            except requests.RequestException as exc:
+                if attempt == 0 and proxy_urls and self.proxy is not None:
+                    self.proxy.mark_failed(exc)
+                    continue
+                raise RawChatError(f"{label}: {exc}") from exc
 
         if not isinstance(envelope, dict) or envelope.get("code") != 1:
             message = (
@@ -364,6 +392,9 @@ class MultiAccountClient:
                             is_quota_exhausted(codex, rolling),
                             "quota data",
                         )
+                    self.source_pool.set_rolling_snapshot(
+                        client.email, rolling, datetime.now()
+                    )
                     results.append(rolling)
                 else:
                     results.append(None)

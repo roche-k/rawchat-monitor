@@ -453,6 +453,12 @@ class AccountConfigurationTests(unittest.TestCase):
 
 
 class ProxyConfigTests(unittest.TestCase):
+    VLESS_LINK = (
+        "vless://11111111-1111-4111-8111-111111111111"
+        "@proxy.example.com:443?encryption=none&security=tls"
+        "&insecure=0&allowInsecure=0&type=tcp&headerType=none#remark"
+    )
+
     def write_config(self, temp_dir, text, mode=0o600):
         path = Path(temp_dir) / "accounts.toml"
         path.write_text(text, encoding="utf-8")
@@ -489,6 +495,100 @@ class ProxyConfigTests(unittest.TestCase):
         self.assertEqual("proxy.example:9050", proxy.socks)
         self.assertEqual("user", proxy.username)
         self.assertEqual("pass", proxy.password)
+
+    def test_load_proxy_config_parses_vless_and_xray_path(self):
+        with tempfile.TemporaryDirectory(dir="test") as temp_dir:
+            path = self.write_config(
+                temp_dir,
+                '[[accounts]]\nemail = "one@example.com"\npassword = "secret"\n'
+                "[proxy]\n"
+                f'url = "{self.VLESS_LINK}"\n'
+                'xray = "/opt/xray"\n',
+            )
+
+            proxy = monitor.load_proxy_config(path)
+
+        self.assertIsNotNone(proxy)
+        self.assertEqual(self.VLESS_LINK, proxy.url)
+        self.assertEqual("/opt/xray", proxy.xray)
+        self.assertEqual({}, proxy.requests_proxies())
+
+    def test_build_xray_config_maps_vless_tls_tcp(self):
+        config = monitor.build_xray_config(self.VLESS_LINK, 18080)
+
+        self.assertEqual(18080, config["inbounds"][0]["port"])
+        self.assertEqual("http", config["inbounds"][0]["protocol"])
+        outbound = config["outbounds"][0]
+        endpoint = outbound["settings"]["vnext"][0]
+        self.assertEqual("proxy.example.com", endpoint["address"])
+        self.assertEqual(443, endpoint["port"])
+        self.assertEqual(
+            "11111111-1111-4111-8111-111111111111",
+            endpoint["users"][0]["id"],
+        )
+        self.assertEqual("tcp", outbound["streamSettings"]["network"])
+        self.assertEqual("tls", outbound["streamSettings"]["security"])
+        self.assertFalse(
+            outbound["streamSettings"]["tlsSettings"]["allowInsecure"]
+        )
+
+    def test_managed_vless_uses_http_inbound_without_socks_dependency(self):
+        config = monitor.build_xray_config(self.VLESS_LINK, 18080)
+
+        self.assertEqual("http", config["inbounds"][0]["protocol"])
+        self.assertEqual({}, config["inbounds"][0]["settings"])
+
+    def test_require_socks_skips_managed_vless(self):
+        proxy = monitor.ProxyConfig(url=self.VLESS_LINK, xray="/opt/xray")
+
+        with mock.patch.dict("sys.modules", {"socks": None}):
+            monitor._require_socks(proxy)
+
+    def test_vless_parser_maps_reality_grpc_and_tls_websocket_options(self):
+        reality_grpc = (
+            "vless://uuid@example.com:443?security=reality&type=grpc"
+            "&sni=cdn.example.com&fp=chrome&pbk=public&sid=short"
+            "&spx=%2F&serviceName=chat&authority=cdn.example.com&mode=multi"
+        )
+        reality_config = monitor.build_xray_config(reality_grpc, 18080)
+        reality_stream = reality_config["outbounds"][0]["streamSettings"]
+        self.assertEqual("reality", reality_stream["security"])
+        self.assertEqual("public", reality_stream["realitySettings"]["publicKey"])
+        self.assertEqual(
+            "chat", reality_stream["grpcSettings"]["serviceName"]
+        )
+        self.assertTrue(reality_stream["grpcSettings"]["multiMode"])
+
+        tls_ws = (
+            "vless://uuid@example.com:443?security=tls&type=ws"
+            "&path=%2Fchat&host=cdn.example.com&ed=1024&eh=Sec-WebSocket-Protocol"
+        )
+        ws_stream = monitor.build_xray_config(tls_ws, 18080)["outbounds"][0][
+            "streamSettings"
+        ]
+        self.assertEqual("/chat", ws_stream["wsSettings"]["path"])
+        self.assertEqual(
+            "cdn.example.com", ws_stream["wsSettings"]["headers"]["Host"]
+        )
+        self.assertEqual(1024, ws_stream["wsSettings"]["maxEarlyData"])
+
+    def test_proxy_config_switches_to_direct_after_failure(self):
+        proxy = monitor.ProxyConfig(socks="127.0.0.1:1080")
+
+        self.assertTrue(proxy.requests_proxies())
+        proxy.mark_failed(ConnectionError("connection refused"))
+
+        self.assertEqual({}, proxy.requests_proxies())
+        self.assertIn("直连", proxy.status_text())
+
+    def test_proxy_config_does_not_restart_after_failure(self):
+        proxy = monitor.ProxyConfig(socks="127.0.0.1:1080")
+        proxy.mark_failed(ConnectionError("connection refused"))
+
+        proxy.start()
+
+        self.assertEqual({}, proxy.requests_proxies())
+        self.assertIn("直连", proxy.status_text())
 
     def test_load_proxy_config_returns_none_when_absent_or_empty(self):
         with tempfile.TemporaryDirectory(dir="test") as temp_dir:
@@ -563,6 +663,40 @@ class ProxyConfigTests(unittest.TestCase):
             {"http": "socks5://127.0.0.1:1080", "https": "socks5://127.0.0.1:1080"},
             client.session.proxies,
         )
+        client.close()
+
+    def test_rawchat_client_retries_direct_after_proxy_connection_error(self):
+        session = mock.Mock()
+        response = mock.Mock()
+        response.json.return_value = {
+            "code": 1,
+            "data": {
+                "codex": {
+                    "apiKey": "key",
+                    "subscriptions": None,
+                    "currentUsage": None,
+                    "recentRecords": [],
+                }
+            },
+        }
+        response.raise_for_status.return_value = None
+        session.get.side_effect = [
+            requests.ConnectionError("proxy reset"),
+            response,
+            response,
+        ]
+        proxy = monitor.ProxyConfig(socks="127.0.0.1:1080")
+        client = monitor.RawChatClient(session=session, proxy=proxy)
+
+        self.assertEqual("key", client.fetch_codex()["apiKey"])
+        self.assertEqual("key", client.fetch_codex()["apiKey"])
+
+        self.assertEqual(3, session.get.call_count)
+        self.assertEqual(
+            {"http": None, "https": None},
+            session.get.call_args.kwargs["proxies"],
+        )
+        self.assertEqual({}, proxy.requests_proxies())
         client.close()
 
     def test_rawchat_client_leaves_proxies_empty_when_not_configured(self):
@@ -750,6 +884,8 @@ class ScriptedUpstream:
 
 
 class ProxyTests(unittest.TestCase):
+    VLESS_LINK = ProxyConfigTests.VLESS_LINK
+
     def test_get_models_is_forwarded_with_source_auth(self):
         self.assertTrue(hasattr(monitor, "RawChatProxyServer"))
         upstream = ScriptedUpstream(
@@ -1602,6 +1738,148 @@ class ProxyTests(unittest.TestCase):
 
         handler.send_response.assert_called_once_with(502)
 
+    def test_proxy_retries_direct_after_proxy_connection_error(self):
+        pool = monitor.SourcePool(
+            [{"email": "one@example.com", "password": "p1"}],
+            keys={"one@example.com": "key-1"},
+        )
+        proxy_config = monitor.ProxyConfig(socks="127.0.0.1:1080")
+        proxy = monitor.RawChatProxyServer(
+            pool, "https://example.invalid", proxy=proxy_config
+        )
+        response = SimpleNamespace(
+            status_code=200,
+            headers={"Content-Length": "2"},
+            content=b"{}",
+            iter_content=lambda chunk_size: iter([b"{}"]),
+            close=mock.Mock(),
+        )
+        session = mock.MagicMock()
+        session.request.side_effect = [requests.ConnectionError("proxy reset"), response]
+        session_context = mock.MagicMock()
+        session_context.__enter__.return_value = session
+        handler = SimpleNamespace(
+            command="POST",
+            path="/v1/responses",
+            headers={"Content-Length": "2"},
+            rfile=io.BytesIO(b"{}"),
+            wfile=io.BytesIO(),
+            close_connection=False,
+            send_response=mock.Mock(),
+            send_header=mock.Mock(),
+            end_headers=mock.Mock(),
+        )
+
+        with mock.patch.object(
+            monitor.requests, "Session", return_value=session_context
+        ):
+            proxy._handle_request(handler)
+
+        self.assertEqual(2, session.request.call_count)
+        self.assertEqual(
+            {"http": None, "https": None},
+            session.request.call_args.kwargs["proxies"],
+        )
+        handler.send_response.assert_called_once_with(200)
+        self.assertEqual(b"{}", handler.wfile.getvalue())
+        self.assertEqual({}, proxy_config.requests_proxies())
+
+    def test_proxy_retries_direct_after_xray_error_response(self):
+        pool = monitor.SourcePool(
+            [{"email": "one@example.com", "password": "p1"}],
+            keys={"one@example.com": "key-1"},
+        )
+        proxy_config = monitor.ProxyConfig(socks="127.0.0.1:1080")
+        proxy = monitor.RawChatProxyServer(
+            pool, "https://example.invalid", proxy=proxy_config
+        )
+        proxy_response = SimpleNamespace(
+            status_code=503,
+            headers={"Proxy-Connection": "close", "Content-Length": "0"},
+            content=b"",
+            close=mock.Mock(),
+        )
+        direct_response = SimpleNamespace(
+            status_code=200,
+            headers={"Content-Length": "2"},
+            content=b"{}",
+            iter_content=lambda chunk_size: iter([b"{}"]),
+            close=mock.Mock(),
+        )
+        session = mock.MagicMock()
+        session.request.side_effect = [proxy_response, direct_response]
+        session_context = mock.MagicMock()
+        session_context.__enter__.return_value = session
+        handler = SimpleNamespace(
+            command="POST",
+            path="/v1/responses",
+            headers={"Content-Length": "2"},
+            rfile=io.BytesIO(b"{}"),
+            wfile=io.BytesIO(),
+            close_connection=False,
+            send_response=mock.Mock(),
+            send_header=mock.Mock(),
+            end_headers=mock.Mock(),
+        )
+
+        with mock.patch.object(
+            monitor.requests, "Session", return_value=session_context
+        ):
+            proxy._handle_request(handler)
+
+        self.assertEqual(2, session.request.call_count)
+        self.assertEqual(
+            {"http": None, "https": None},
+            session.request.call_args.kwargs["proxies"],
+        )
+        handler.send_response.assert_called_once_with(200)
+        self.assertEqual(b"{}", handler.wfile.getvalue())
+        self.assertEqual({}, proxy_config.requests_proxies())
+        proxy_response.close.assert_called_once_with()
+
+    def test_managed_xray_process_is_started_and_stopped(self):
+        proxy_config = monitor.ProxyConfig(url=self.VLESS_LINK, xray="xray")
+        process = mock.Mock()
+        process.poll.return_value = None
+        probe = mock.MagicMock()
+        probe.__enter__.return_value = probe
+        probe.getsockname.return_value = ("127.0.0.1", 18080)
+        ready = mock.MagicMock()
+        ready.__enter__.return_value = ready
+        config_fd = os.open(os.devnull, os.O_RDONLY)
+
+        with mock.patch("rawchat.config.shutil.which", return_value="/usr/bin/xray"), mock.patch(
+            "rawchat.config.socket.socket", return_value=probe
+        ), mock.patch(
+            "rawchat.config.socket.create_connection", return_value=ready
+        ), mock.patch(
+            "rawchat.config.subprocess.Popen", return_value=process
+        ), mock.patch(
+            "rawchat.config.tempfile.mkstemp",
+            return_value=(config_fd, "test/tmp/xray-runtime-config.json"),
+        ):
+            Path("test/tmp/xray-runtime-config.json").write_text("{}")
+            proxy_config.start()
+            proxy_config.stop()
+
+        self.assertTrue(process.terminate.called)
+
+
+class DashboardProxyStatusTests(unittest.TestCase):
+    def test_summary_shows_proxy_usage_status(self):
+        state = monitor.DashboardState(
+            proxy_config=monitor.ProxyConfig(socks="127.0.0.1:1080")
+        )
+
+        lines = monitor.build_summary_lines(
+            state,
+            wall_now=datetime(2026, 7, 14, 10, 20),
+            monotonic_now=0.0,
+        )
+
+        self.assertIn("代理使用中", lines[0])
+        self.assertIn("当前代理", lines[0])
+
 
 class CodexConfigManagerTests(unittest.TestCase):
     def test_apply_preserves_unrelated_toml_without_backup_or_restore(self):
@@ -1681,6 +1959,56 @@ class ClientTests(unittest.TestCase):
         response.json.return_value = payload
         response.raise_for_status.return_value = None
         return response
+
+    def test_rawchat_client_does_not_retry_direct_after_json_decode_error(self):
+        session = mock.Mock()
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.side_effect = requests.exceptions.JSONDecodeError(
+            "malformed response", "{}", 0
+        )
+        session.get.return_value = response
+        proxy = monitor.ProxyConfig(socks="127.0.0.1:1080")
+        client = monitor.RawChatClient(session=session, proxy=proxy)
+
+        with self.assertRaises(monitor.RawChatError):
+            client.fetch_codex()
+
+        self.assertEqual(1, session.get.call_count)
+        self.assertTrue(proxy.requests_proxies())
+        client.close()
+
+    def test_rawchat_client_retries_direct_after_xray_error_response(self):
+        session = mock.Mock()
+        proxy_response = mock.Mock()
+        proxy_response.status_code = 503
+        proxy_response.headers = {"Proxy-Connection": "close"}
+        direct_response = self.response(
+            {
+                "code": 1,
+                "data": {
+                    "codex": {
+                        "apiKey": "key",
+                        "subscriptions": None,
+                        "currentUsage": None,
+                        "recentRecords": [],
+                    }
+                },
+            }
+        )
+        session.get.side_effect = [proxy_response, direct_response]
+        proxy = monitor.ProxyConfig(socks="127.0.0.1:1080")
+        client = monitor.RawChatClient(session=session, proxy=proxy)
+
+        self.assertEqual("key", client.fetch_codex()["apiKey"])
+        self.assertEqual(2, session.get.call_count)
+        self.assertEqual(
+            {"http": None, "https": None},
+            session.get.call_args.kwargs["proxies"],
+        )
+        self.assertEqual({}, proxy.requests_proxies())
+        proxy_response.close.assert_called_once_with()
+        client.close()
 
     def test_fetch_codex_returns_only_codex(self):
         self.assertTrue(hasattr(monitor, "RawChatClient"))
@@ -2454,18 +2782,24 @@ class LayoutTests(unittest.TestCase):
 
         with mock.patch.object(
             dashboard_module,
-            "load_proxy_request_total",
-            return_value=41,
-        ) as load_total, mock.patch.object(
+            "load_proxy_metrics",
+            return_value=(41, 125.0, 500.0),
+        ) as load_metrics, mock.patch.object(
             dashboard_module,
             "refresh_dashboard_data",
             wraps=dashboard_module.refresh_dashboard_data,
         ) as refresh_data:
             monitor.apply_outcome(state, outcome)
 
-        load_total.assert_called_once()
-        refresh_data.assert_called_once_with(state, proxy_request_total=41)
+        load_metrics.assert_called_once()
+        refresh_data.assert_called_once_with(
+            state,
+            proxy_request_total=41,
+            proxy_metrics=(125.0, 500.0),
+        )
         self.assertEqual(41, state.proxy_request_total)
+        self.assertEqual(125.0, state.proxy_avg_first_byte_ms)
+        self.assertEqual(500.0, state.proxy_avg_response_ms)
 
     def test_summary_shows_per_account_lines_with_rolling_and_subs(self):
         self.assertTrue(hasattr(monitor, "build_summary_lines"))
@@ -3170,6 +3504,34 @@ class RuntimeTests(unittest.TestCase):
                 Path(temp_dir) / "accounts.toml"
             )
 
+    def test_runtime_falls_back_to_direct_when_pysocks_is_missing(self):
+        with tempfile.TemporaryDirectory(dir="test") as temp_dir:
+            args = SimpleNamespace(
+                proxy_port=15872,
+                upstream_url="http://127.0.0.1:1",
+                key_cache=str(Path(temp_dir) / "keys.json"),
+                codex_config=str(Path(temp_dir) / "config.toml"),
+                accounts_file="test/accounts.toml",
+                apply_codex_config=False,
+            )
+            proxy = monitor.ProxyConfig(socks="127.0.0.1:1080")
+            with mock.patch.object(
+                runtime_module,
+                "load_accounts",
+                return_value=[{"email": "one@example.com", "password": "secret"}],
+            ), mock.patch.object(
+                runtime_module, "load_proxy_config", return_value=proxy
+            ), mock.patch.object(
+                runtime_module,
+                "_require_socks",
+                side_effect=RuntimeError("PySocks missing"),
+            ):
+                runtime = monitor.build_runtime(args)
+
+            self.assertEqual({}, proxy.requests_proxies())
+            self.assertIn("直连", proxy.status_text())
+            runtime.proxy.stop()
+
     def test_default_worker_factory_passes_configured_proxy_to_clients(self):
         accounts = [{"email": "one@example.com", "password": "secret"}]
         proxy = monitor.ProxyConfig(socks="127.0.0.1:1080")
@@ -3712,6 +4074,84 @@ class StatisticsTests(unittest.TestCase):
 
         self.assertEqual(2, total)
 
+    def test_load_proxy_metrics_averages_completed_local_latencies(self):
+        with tempfile.TemporaryDirectory(dir="test") as temp_dir:
+            log_path = Path(temp_dir) / "rawchat_proxy_2026-07-14.jsonl"
+            log_path.write_text(
+                "\n".join(
+                    json.dumps(event)
+                    for event in (
+                        {"event": "request_received"},
+                        {
+                            "event": "upstream_response",
+                            "response_complete": True,
+                            "first_byte_time_ms": 100.0,
+                            "response_time_ms": 300.0,
+                        },
+                        {
+                            "event": "upstream_response",
+                            "response_complete": True,
+                            "first_byte_time_ms": 200.0,
+                            "response_time_ms": 500.0,
+                        },
+                        {
+                            "event": "upstream_response",
+                            "response_complete": False,
+                            "first_byte_time_ms": 999.0,
+                            "response_time_ms": 888.0,
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            total, avg_first_byte, avg_resp = dashboard_module.load_proxy_metrics(
+                temp_dir, datetime(2026, 7, 14, 12, 0)
+            )
+
+        self.assertEqual(1, total)
+        self.assertEqual(150.0, avg_first_byte)
+        self.assertEqual(400.0, avg_resp)
+
+    def test_load_proxy_metrics_returns_none_when_no_completed_response(self):
+        with tempfile.TemporaryDirectory(dir="test") as temp_dir:
+            log_path = Path(temp_dir) / "rawchat_proxy_2026-07-14.jsonl"
+            log_path.write_text(
+                json.dumps({"event": "request_received"}) + "\n",
+                encoding="utf-8",
+            )
+
+            total, avg_first_byte, avg_resp = dashboard_module.load_proxy_metrics(
+                temp_dir, datetime(2026, 7, 14, 12, 0)
+            )
+
+        self.assertEqual(1, total)
+        self.assertIsNone(avg_first_byte)
+        self.assertIsNone(avg_resp)
+
+    def test_stats_lines_show_local_proxy_latency_averages(self):
+        state = monitor.DashboardState(all_records=[make_record()])
+        state.proxy_request_total = 23
+        state.proxy_avg_first_byte_ms = 125.0
+        state.proxy_avg_response_ms = 500.0
+
+        lines = monitor.build_stats_lines(state, 120)
+
+        self.assertIn("代理请求 23", lines[0])
+        self.assertIn("代理首字均 0.12s", lines[0])
+        self.assertIn("代理响应均 0.50s", lines[0])
+
+    def test_build_stats_omits_proxy_latency_when_unavailable(self):
+        state = monitor.DashboardState(all_records=[make_record()])
+        state.proxy_request_total = 23
+
+        lines = dashboard_module.build_stats_lines(state, 120)
+
+        self.assertIn("代理请求 23", lines[0])
+        self.assertNotIn("代理首字均", lines[0])
+        self.assertNotIn("代理响应均", lines[0])
+
     def test_compute_statistics_aggregates_tokens_and_cache(self):
         self.assertTrue(hasattr(monitor, "compute_statistics"))
         records = [
@@ -3874,6 +4314,334 @@ class CostChartTests(unittest.TestCase):
         self.assertTrue(hasattr(monitor, "build_token_chart"))
         chart = monitor.build_token_chart([], width=40, height=8)
         self.assertEqual(["暂无图表数据"], chart)
+
+
+class CodexQuotaHeadersTests(unittest.TestCase):
+    """Codex 额度头的转换与代理注入。"""
+
+    def _rolling(self, remaining=9.237124, limit=30.0, enabled=True,
+                 release_at=None, window_extra=None):
+        window = {"remainingUsd": remaining, "limitUsd": limit, "enabled": enabled}
+        if release_at is not None:
+            window["releaseAt"] = release_at
+        if window_extra:
+            window.update(window_extra)
+        return {"enabled": enabled, "window": window}
+
+    def test_remaining_9237_of_30_gives_6921_used_300_minutes(self):
+        headers = monitor._codex_quota_headers(
+            self._rolling(remaining=9.237124, limit=30.0)
+        )
+        self.assertEqual(
+            "69.21",
+            headers.get("x-codex-primary-used-percent"),
+        )
+        self.assertEqual(
+            "300", headers.get("x-codex-primary-window-minutes")
+        )
+
+    def test_zero_remaining_gives_100(self):
+        headers = monitor._codex_quota_headers(self._rolling(remaining=0.0))
+        self.assertEqual("100.00", headers.get("x-codex-primary-used-percent"))
+
+    def test_negative_remaining_gives_100(self):
+        headers = monitor._codex_quota_headers(self._rolling(remaining=-3.0))
+        self.assertEqual("100.00", headers.get("x-codex-primary-used-percent"))
+
+    def test_remaining_over_limit_gives_0(self):
+        headers = monitor._codex_quota_headers(
+            self._rolling(remaining=50.0, limit=30.0)
+        )
+        self.assertEqual("0.00", headers.get("x-codex-primary-used-percent"))
+
+    def test_missing_fields_give_no_headers(self):
+        self.assertEqual({}, monitor._codex_quota_headers({}))
+        self.assertEqual(
+            {},
+            monitor._codex_quota_headers(
+                {"enabled": True, "window": {"remainingUsd": 5.0}}
+            ),
+        )
+        self.assertEqual(
+            {},
+            monitor._codex_quota_headers(
+                {"enabled": True, "window": {"limitUsd": 0.0, "remainingUsd": 5.0}}
+            ),
+        )
+
+    def test_disabled_rolling_gives_no_headers(self):
+        self.assertEqual(
+            {},
+            monitor._codex_quota_headers(self._rolling(enabled=False)),
+        )
+
+    def test_non_finite_values_give_no_headers(self):
+        self.assertEqual(
+            {},
+            monitor._codex_quota_headers(
+                self._rolling(limit=float("nan"), remaining=5.0)
+            ),
+        )
+        self.assertEqual(
+            {},
+            monitor._codex_quota_headers(
+                self._rolling(limit=30.0, remaining=float("inf"))
+            ),
+        )
+
+    def test_null_release_at_gives_no_reset(self):
+        headers = monitor._codex_quota_headers(
+            self._rolling(remaining=9.0, release_at=None)
+        )
+        self.assertNotIn("x-codex-primary-reset-at", headers)
+        self.assertIn("x-codex-primary-used-percent", headers)
+
+    def test_future_release_at_converts_to_unix_seconds(self):
+        future = "2099-01-01T00:00:00+00:00"
+        headers = monitor._codex_quota_headers(
+            self._rolling(remaining=9.0, release_at=future)
+        )
+        self.assertEqual(
+            str(int(datetime.fromisoformat("2099-01-01T00:00:00+00:00").timestamp())),
+            headers["x-codex-primary-reset-at"],
+        )
+
+    def test_past_release_at_gives_no_reset_header(self):
+        headers = monitor._codex_quota_headers(
+            self._rolling(remaining=9.0, release_at="2000-01-01T00:00:00+00:00")
+        )
+        self.assertNotIn("x-codex-primary-reset-at", headers)
+
+    def _proxy_with_snapshot(self, accounts, snapshots, scripts):
+        upstream = ScriptedUpstream(scripts)
+        pool = monitor.SourcePool(accounts, keys={
+            account["email"]: f"key-{index}"
+            for index, account in enumerate(accounts, start=1)
+        })
+        now = datetime.now()
+        for email, rolling in snapshots.items():
+            if rolling is not None:
+                pool.set_rolling_snapshot(email, rolling, now)
+        proxy = monitor.RawChatProxyServer(pool, upstream.base_url)
+        proxy.start()
+        return upstream, pool, proxy
+
+    def test_proxy_headers_follow_the_actual_source(self):
+        upstream, pool, proxy = self._proxy_with_snapshot(
+            [
+                {"email": "one@example.com", "password": "p1"},
+                {"email": "two@example.com", "password": "p2"},
+            ],
+            {
+                "one@example.com": self._rolling(remaining=9.237124, limit=30.0),
+                "two@example.com": self._rolling(remaining=15.0, limit=30.0),
+            },
+            [(200, {"content-type": "application/json"}, b'{"id":"ok"}')],
+        )
+        try:
+            response = requests.post(
+                f"{proxy.base_url}/v1/responses",
+                json={"model": "gpt-5.4", "input": "ping"},
+                timeout=5,
+            )
+            self.assertEqual(200, response.status_code)
+            # 首选 source 是 one@example.com
+            self.assertEqual(
+                "69.21",
+                response.headers.get("x-codex-primary-used-percent"),
+            )
+            self.assertEqual(
+                "300", response.headers.get("x-codex-primary-window-minutes")
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def test_proxy_headers_follow_switched_source_after_quota_error(self):
+        upstream, pool, proxy = self._proxy_with_snapshot(
+            [
+                {"email": "one@example.com", "password": "p1"},
+                {"email": "two@example.com", "password": "p2"},
+            ],
+            {
+                "one@example.com": self._rolling(remaining=9.237124, limit=30.0),
+                "two@example.com": self._rolling(remaining=15.0, limit=30.0),
+            },
+            [
+                (402, {"content-type": "application/json"},
+                 b'{"error":"quota exhausted"}'),
+                (200, {"content-type": "application/json"}, b'{"id":"resp-2"}'),
+            ],
+        )
+        try:
+            response = requests.post(
+                f"{proxy.base_url}/v1/responses",
+                json={"model": "gpt-5.4", "input": "ping"},
+                timeout=5,
+            )
+            self.assertEqual(200, response.status_code)
+            # 最终成功 source 是 two@example.com
+            expected = monitor._codex_quota_headers(
+                self._rolling(remaining=15.0, limit=30.0)
+            )["x-codex-primary-used-percent"]
+            self.assertTrue(expected.startswith("50."))
+            self.assertEqual(
+                response.headers.get("x-codex-primary-used-percent"),
+                expected,
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def test_proxy_omits_headers_when_snapshot_missing(self):
+        upstream, pool, proxy = self._proxy_with_snapshot(
+            [{"email": "one@example.com", "password": "p1"}],
+            {"one@example.com": None},
+            [(200, {"content-type": "application/json"}, b'{"id":"ok"}')],
+        )
+        try:
+            response = requests.post(
+                f"{proxy.base_url}/v1/responses",
+                json={"model": "gpt-5.4", "input": "ping"},
+                timeout=5,
+            )
+            self.assertEqual(200, response.status_code)
+            self.assertNotIn("x-codex-primary-used-percent", response.headers)
+            self.assertNotIn("x-codex-primary-window-minutes", response.headers)
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def test_proxy_omits_headers_when_snapshot_stale(self):
+        upstream = ScriptedUpstream(
+            [(200, {"content-type": "application/json"}, b'{"id":"ok"}')]
+        )
+        pool = monitor.SourcePool(
+            [{"email": "one@example.com", "password": "p1"}],
+            keys={"one@example.com": "key-1"},
+        )
+        # 早于刷新 TTL：过期
+        from datetime import timedelta
+        past = datetime.now() - timedelta(seconds=monitor.REFRESH_INTERVAL + 60)
+        pool.set_rolling_snapshot(
+            "one@example.com", self._rolling(remaining=9.0, limit=30.0), past
+        )
+        proxy = monitor.RawChatProxyServer(pool, upstream.base_url)
+        proxy.start()
+        try:
+            response = requests.post(
+                f"{proxy.base_url}/v1/responses",
+                json={"model": "gpt-5.4", "input": "ping"},
+                timeout=5,
+            )
+            self.assertEqual(200, response.status_code)
+            self.assertNotIn("x-codex-primary-used-percent", response.headers)
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def test_proxy_sse_streams_body_and_injects_headers(self):
+        sse_body = b"data: {\"event\":\"response.completed\"}\n\n"
+        requests_seen = []
+
+        class SseHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                requests_seen.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(sse_body)
+                self.wfile.flush()
+
+            def log_message(self, *_args):
+                return
+
+        upstream_server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), SseHandler
+        )
+        upstream_thread = threading.Thread(
+            target=upstream_server.serve_forever, daemon=True
+        )
+        upstream_thread.start()
+        upstream_base = (
+            f"http://127.0.0.1:{upstream_server.server_port}"
+        )
+        pool = monitor.SourcePool(
+            [{"email": "one@example.com", "password": "p1"}],
+            keys={"one@example.com": "key-1"},
+        )
+        pool.set_rolling_snapshot(
+            "one@example.com",
+            self._rolling(remaining=9.237124, limit=30.0),
+            datetime.now(),
+        )
+        proxy = monitor.RawChatProxyServer(pool, upstream_base)
+        proxy.start()
+        try:
+            response = requests.post(
+                f"{proxy.base_url}/v1/responses",
+                json={"model": "gpt-5.4", "input": "ping"},
+                timeout=5,
+                stream=True,
+            )
+            self.assertEqual(200, response.status_code)
+            self.assertEqual(
+                "69.21", response.headers.get("x-codex-primary-used-percent")
+            )
+            self.assertEqual(
+                "300", response.headers.get("x-codex-primary-window-minutes")
+            )
+            self.assertEqual(sse_body, response.raw.read())
+            self.assertEqual(["/v1/responses"], requests_seen)
+        finally:
+            proxy.stop()
+            upstream_server.shutdown()
+            upstream_server.server_close()
+
+    def test_no_usage_endpoints_hit_through_proxy(self):
+        upstream, pool, proxy = self._proxy_with_snapshot(
+            [{"email": "one@example.com", "password": "p1"}],
+            {"one@example.com": self._rolling(remaining=9.0, limit=30.0)},
+            [(200, {"content-type": "application/json"}, b'{"id":"ok"}')],
+        )
+        try:
+            requests.post(
+                f"{proxy.base_url}/v1/responses",
+                json={"model": "gpt-5.4", "input": "ping"},
+                timeout=5,
+            )
+            paths = [r["path"] for r in upstream.requests]
+            self.assertTrue(any("/v1/responses" in p for p in paths))
+            self.assertFalse(any("/api/codex/usage" in p for p in paths))
+            self.assertFalse(any("/wham/usage" in p for p in paths))
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def test_proxy_error_response_has_no_local_quota_headers(self):
+        # 4xx/5xx 成功路径之外：错误响应不应带本地额度头
+        upstream, pool, proxy = self._proxy_with_snapshot(
+            [{"email": "one@example.com", "password": "p1"}],
+            {"one@example.com": self._rolling(remaining=9.0, limit=30.0)},
+            [(402, {"content-type": "application/json"}, b'{"error":"quota exhausted"}'),
+             (500, {"content-type": "application/json"}, b'{"error":"server"}')],
+        )
+        try:
+            response = requests.post(
+                f"{proxy.base_url}/v1/responses",
+                json={"model": "gpt-5.4", "input": "ping"},
+                timeout=5,
+            )
+            self.assertIn(response.status_code, (402, 403, 500, 503))
+            self.assertNotIn("x-codex-primary-used-percent", response.headers)
+        finally:
+            proxy.stop()
+            upstream.stop()
 
 
 if __name__ == "__main__":
