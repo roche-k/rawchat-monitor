@@ -41,47 +41,57 @@ _HOP_BY_HOP_HEADERS = {
 
 
 def _codex_quota_headers(rolling: Any, now: Any = datetime.now) -> dict[str, str]:
-    """将 RawChat rolling 快照转换为 Codex 额度头，缺失/非法时返回空 dict。
+    """将一个或多个 RawChat rolling 快照转换为 Codex 额度头。
 
     成功注入头：
       x-codex-primary-used-percent
       x-codex-primary-window-minutes  始终 300
-      x-codex-primary-reset-at        仅当 releaseAt 是有效未来时间
+      x-codex-primary-reset-at        最近的有效未来 releaseAt
     """
-    if not isinstance(rolling, dict):
-        return {}
-    if rolling.get("enabled") is not True:
-        return {}
-    window = rolling.get("window")
-    if not isinstance(window, dict):
-        return {}
-    limit_usd = _number(window.get("limitUsd"))
-    if limit_usd is None or limit_usd <= 0:
-        return {}
-    remaining = _number(window.get("remainingUsd"))
-    if remaining is None:
-        return {}
-    if remaining < 0:
-        used_percent = 100.0
-    elif remaining > limit_usd:
-        used_percent = 0.0
+    if isinstance(rolling, dict):
+        snapshots = (rolling,)
+    elif isinstance(rolling, (list, tuple)):
+        snapshots = rolling
     else:
-        used_percent = max(
-            0.0,
-            min(100.0, (1.0 - remaining / limit_usd) * 100.0),
-        )
+        return {}
+
+    total_limit = 0.0
+    total_remaining = 0.0
+    reset_candidates = []
+    now_value = now()
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict) or snapshot.get("enabled") is not True:
+            continue
+        window = snapshot.get("window")
+        if not isinstance(window, dict):
+            continue
+        limit_usd = _number(window.get("limitUsd"))
+        remaining = _number(window.get("remainingUsd"))
+        if limit_usd is None or limit_usd <= 0 or remaining is None:
+            continue
+        total_limit += limit_usd
+        total_remaining += max(0.0, min(limit_usd, remaining))
+        release_str = window.get("releaseAt")
+        if isinstance(release_str, str) and release_str:
+            release_at = _parse_datetime(release_str)
+            if release_at is not None and release_at > now_value:
+                reset_candidates.append(release_at)
+
+    if total_limit <= 0:
+        return {}
+    used_percent = max(
+        0.0,
+        min(100.0, (1.0 - total_remaining / total_limit) * 100.0),
+    )
     used_percent = round(used_percent, 2)
     headers = {
         "x-codex-primary-used-percent": f"{used_percent:.2f}",
         "x-codex-primary-window-minutes": "300",
     }
-    release_str = window.get("releaseAt")
-    if isinstance(release_str, str) and release_str:
-        release_at = _parse_datetime(release_str)
-        if release_at is not None and release_at > now():
-            headers["x-codex-primary-reset-at"] = str(
-                int(release_at.timestamp())
-            )
+    if reset_candidates:
+        headers["x-codex-primary-reset-at"] = str(
+            int(min(reset_candidates).timestamp())
+        )
     return headers
 
 
@@ -403,15 +413,11 @@ class RawChatProxyServer:
     def _inject_codex_quota_headers(
         self,
         response: requests.Response,
-        email: str,
     ) -> None:
-        rolling, fetched_at = self.source_pool.get_rolling_snapshot(email)
-        if rolling is None or fetched_at is None:
-            return
-        age = datetime.now() - fetched_at
-        if age.total_seconds() > REFRESH_INTERVAL:
-            return
-        headers = _codex_quota_headers(rolling)
+        snapshots = self.source_pool.get_available_rolling_snapshots(
+            REFRESH_INTERVAL
+        )
+        headers = _codex_quota_headers(snapshots)
         if not headers:
             return
         for name, value in headers.items():
@@ -649,7 +655,7 @@ class RawChatProxyServer:
 
                     if 200 <= response.status_code < 400:
                         self.source_pool.mark_success(source.email)
-                        self._inject_codex_quota_headers(response, source.email)
+                        self._inject_codex_quota_headers(response)
                     response_finished_at, response_complete = self._send_stream(
                         handler, response
                     )

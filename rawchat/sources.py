@@ -169,6 +169,36 @@ class SourcePool:
                     return source.rolling_limit, source.rolling_fetched_at
         return None, None
 
+    def get_available_rolling_snapshots(
+        self,
+        max_age_seconds: float | None = None,
+    ) -> list[dict[str, Any]]:
+        now = datetime.now()
+        with self._lock:
+            snapshots: list[dict[str, Any]] = []
+            for source in self._sources:
+                if not source.api_key:
+                    continue
+                if not source.quota_available:
+                    if source.release_at is None or now < source.release_at:
+                        continue
+                    source.quota_available = True
+                    source.reason = None
+                    source.release_at = None
+                if source.rolling_limit is None:
+                    continue
+                fetched_at = source.rolling_fetched_at
+                if (
+                    max_age_seconds is not None
+                    and (
+                        fetched_at is None
+                        or (now - fetched_at).total_seconds() > max_age_seconds
+                    )
+                ):
+                    continue
+                snapshots.append(dict(source.rolling_limit))
+            return snapshots
+
     def update_quota(
         self,
         email: str,

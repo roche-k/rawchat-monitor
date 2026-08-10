@@ -4426,7 +4426,7 @@ class CodexQuotaHeadersTests(unittest.TestCase):
         proxy.start()
         return upstream, pool, proxy
 
-    def test_proxy_headers_follow_the_actual_source(self):
+    def test_proxy_headers_aggregate_available_sources(self):
         upstream, pool, proxy = self._proxy_with_snapshot(
             [
                 {"email": "one@example.com", "password": "p1"},
@@ -4445,13 +4445,47 @@ class CodexQuotaHeadersTests(unittest.TestCase):
                 timeout=5,
             )
             self.assertEqual(200, response.status_code)
-            # 首选 source 是 one@example.com
+            # 两个可用 source 合计：总额度 60，剩余 24.237124。
             self.assertEqual(
-                "69.21",
+                "59.60",
                 response.headers.get("x-codex-primary-used-percent"),
             )
             self.assertEqual(
                 "300", response.headers.get("x-codex-primary-window-minutes")
+            )
+        finally:
+            proxy.stop()
+            upstream.stop()
+
+    def test_proxy_headers_restore_source_after_release_at_expires(self):
+        from datetime import timedelta
+
+        upstream, pool, proxy = self._proxy_with_snapshot(
+            [
+                {"email": "one@example.com", "password": "p1"},
+                {"email": "two@example.com", "password": "p2"},
+            ],
+            {
+                "one@example.com": self._rolling(remaining=9.237124, limit=30.0),
+                "two@example.com": self._rolling(remaining=15.0, limit=30.0),
+            },
+            [(200, {"content-type": "application/json"}, b'{"id":"ok"}')],
+        )
+        pool.mark_quota_exhausted(
+            "two@example.com",
+            "quota",
+            datetime.now() - timedelta(seconds=1),
+        )
+        try:
+            response = requests.post(
+                f"{proxy.base_url}/v1/responses",
+                json={"model": "gpt-5.4", "input": "ping"},
+                timeout=5,
+            )
+            self.assertEqual(200, response.status_code)
+            self.assertEqual(
+                "59.60",
+                response.headers.get("x-codex-primary-used-percent"),
             )
         finally:
             proxy.stop()
