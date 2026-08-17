@@ -34,6 +34,7 @@ from .dashboard import (
     init_curses,
     layout_for_size,
     load_proxy_metrics,
+    load_proxy_latency_matches,
     render_dashboard,
 )
 from .proxy import RawChatProxyServer
@@ -256,16 +257,24 @@ def run_dashboard(
         worker = worker_factory()
     store = RecordStore(log_dir=LOG_DIR)
     started_at = time.monotonic()
+    initial_records = store.all_records()
     proxy_request_total, proxy_avg_first_byte_ms, proxy_avg_response_ms = (
         load_proxy_metrics(LOG_DIR)
     )
+    proxy_latency_by_record_key = load_proxy_latency_matches(
+        LOG_DIR,
+        initial_records,
+        datetime.now(),
+        runtime.source_pool if runtime is not None else None,
+    )
     state = DashboardState(
         next_refresh_at=started_at + REFRESH_INTERVAL,
-        all_records=store.all_records(),
+        all_records=initial_records,
         source_pool=runtime.source_pool if runtime is not None else None,
         proxy_request_total=proxy_request_total,
         proxy_avg_first_byte_ms=proxy_avg_first_byte_ms,
         proxy_avg_response_ms=proxy_avg_response_ms,
+        proxy_latency_by_record_key=proxy_latency_by_record_key,
         proxy_config=(
             getattr(runtime.proxy, "proxy", None)
             if runtime is not None

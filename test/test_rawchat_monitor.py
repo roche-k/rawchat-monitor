@@ -151,10 +151,25 @@ class SnapshotFormattingTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(16, len(values))
+        self.assertEqual(18, len(values))
         self.assertEqual("成功", values[-3])
         self.assertEqual("one@example.com", values[-2])
         self.assertEqual("127.0.0.1", values[-1])
+
+    def test_record_values_include_proxy_latencies_without_mutating_record(self):
+        record = {
+            "requestId": "display-only",
+            "requestTime": "2026-07-14T10:20:30",
+            "responseTime": 2000,
+            "firstByteTime": 500,
+            "status": "success",
+        }
+
+        values = monitor.record_values(record, (125.0, 500.0))
+
+        self.assertEqual("0.12s", values[13])
+        self.assertEqual("0.50s", values[14])
+        self.assertNotIn("proxy", record)
 
     def test_invalid_time_and_unknown_status_render_as_missing(self):
         values = monitor.record_values(
@@ -1345,11 +1360,12 @@ class ProxyTests(unittest.TestCase):
         session.request.return_value = response
         session_context = mock.MagicMock()
         session_context.__enter__.return_value = session
+        request_body = b'{"model":"gpt-5.6-sol"}'
         handler = SimpleNamespace(
             command="POST",
             path="/v1/responses",
-            headers={"Content-Length": "2"},
-            rfile=io.BytesIO(b"{}"),
+            headers={"Content-Length": str(len(request_body))},
+            rfile=io.BytesIO(request_body),
             wfile=io.BytesIO(),
             close_connection=False,
             send_response=mock.Mock(),
@@ -1376,6 +1392,17 @@ class ProxyTests(unittest.TestCase):
             ]
 
         self.assertEqual(1, len(upstream_events))
+        request_events = [
+            event for event in events if event["event"] == "request_received"
+        ]
+        self.assertEqual(1, len(request_events))
+        self.assertIn(".", request_events[0]["time"])
+        self.assertEqual("one@example.com", upstream_events[0]["source_email"])
+        self.assertEqual(
+            request_events[0]["proxy_request_id"],
+            upstream_events[0]["proxy_request_id"],
+        )
+        self.assertEqual("gpt-5.6-sol", upstream_events[0]["model"])
         self.assertEqual(125.0, upstream_events[0]["first_byte_time_ms"])
         self.assertEqual(500.0, upstream_events[0]["response_time_ms"])
         self.assertEqual(b"abc", handler.wfile.getvalue())
@@ -4499,6 +4526,313 @@ class StatisticsTests(unittest.TestCase):
         self.assertEqual(1, total)
         self.assertIsNone(avg_first_byte)
         self.assertIsNone(avg_resp)
+
+    def test_proxy_latency_matching_uses_global_best_sequence(self):
+        records = [
+            make_record(
+                requestId="r1",
+                requestTime="2026-07-14T10:00:00",
+                responseTime=1000,
+                model="gpt-5.6-sol-max",
+                _account_email="one@example.com",
+            ),
+            make_record(
+                requestId="r2",
+                requestTime="2026-07-14T10:00:01",
+                responseTime=1800,
+                model="gpt-5.6-sol-max",
+                _account_email="one@example.com",
+            ),
+        ]
+        events = [
+            {
+                "event": "upstream_response",
+                "time": "2026-07-14T10:00:00.500000+08:00",
+                "model": "gpt-5.6-sol",
+                "source": "account-1",
+                "status": 200,
+                "switching": False,
+                "response_complete": True,
+                "first_byte_time_ms": 111,
+                "response_time_ms": 222,
+            },
+            {
+                "event": "upstream_response",
+                "time": "2026-07-14T10:00:01+08:00",
+                "model": "gpt-5.6-sol",
+                "source": "account-1",
+                "status": 200,
+                "switching": False,
+                "response_complete": True,
+                "first_byte_time_ms": 333,
+                "response_time_ms": 444,
+            },
+        ]
+
+        with tempfile.TemporaryDirectory(dir="test") as temp_dir:
+            log_path = Path(temp_dir) / "rawchat_proxy_2026-07-14.jsonl"
+            log_path.write_text(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                encoding="utf-8",
+            )
+
+            matches = dashboard_module.load_proxy_latency_matches(
+                temp_dir,
+                records,
+                datetime(2026, 7, 14, 12, 0),
+            )
+
+        self.assertEqual(
+            (111.0, 222.0), matches[monitor.record_key(records[0])]
+        )
+        self.assertEqual(
+            (333.0, 444.0), matches[monitor.record_key(records[1])]
+        )
+
+    def test_proxy_retry_events_from_one_request_form_one_candidate(self):
+        records = [
+            make_record(
+                requestId="unrelated-failure",
+                requestTime="2026-07-14T09:59:59",
+                responseTime=2000,
+                model="gpt-5.6-sol-max",
+                status="failed",
+                _account_email="one@example.com",
+            ),
+            make_record(
+                requestId="actual-success",
+                requestTime="2026-07-14T10:00:00",
+                responseTime=2000,
+                model="gpt-5.6-sol-max",
+                status="success",
+                _account_email="one@example.com",
+            ),
+        ]
+        events = [
+            {
+                "event": "upstream_response",
+                "time": "2026-07-14T10:00:01",
+                "proxy_request_id": "request-1",
+                "source_email": "one@example.com",
+                "source": "account-1",
+                "model": "gpt-5.6-sol",
+                "status": 429,
+                "switching": True,
+                "response_complete": True,
+                "first_byte_time_ms": 100,
+                "response_time_ms": 200,
+            },
+            {
+                "event": "upstream_response",
+                "time": "2026-07-14T10:00:02",
+                "proxy_request_id": "request-1",
+                "source_email": "one@example.com",
+                "source": "account-1",
+                "model": "gpt-5.6-sol",
+                "status": 200,
+                "switching": False,
+                "response_complete": True,
+                "first_byte_time_ms": 300,
+                "response_time_ms": 400,
+            },
+        ]
+
+        matches = dashboard_module.match_proxy_latencies(records, events)
+
+        self.assertEqual(
+            {monitor.record_key(records[1]): (300.0, 400.0)}, matches
+        )
+
+    def test_stable_source_email_overrides_account_label_order(self):
+        records = [
+            make_record(
+                requestId="account-one",
+                requestTime="2026-01-01T10:00:00",
+                responseTime=2000,
+                model="gpt-5.6-sol-max",
+                _account_email="one@example.com",
+            ),
+            make_record(
+                requestId="account-two",
+                requestTime="2026-01-01T10:00:00",
+                responseTime=2000,
+                model="gpt-5.6-sol-max",
+                _account_email="two@example.com",
+            ),
+        ]
+        event = {
+            "event": "upstream_response",
+            "time": "2026-01-01T10:00:02",
+            "proxy_request_id": "request-2",
+            "source_email": "two@example.com",
+            "source": "account-1",
+            "model": "gpt-5.6-sol",
+            "status": 200,
+            "switching": False,
+            "response_complete": True,
+            "first_byte_time_ms": 300,
+            "response_time_ms": 400,
+        }
+
+        matches = dashboard_module.match_proxy_latencies(records, [event])
+
+        self.assertEqual(
+            {monitor.record_key(records[1]): (300.0, 400.0)}, matches
+        )
+
+    def test_legacy_events_do_not_cross_match_multiple_accounts(self):
+        records = [
+            make_record(
+                requestId="account-one",
+                requestTime="2026-01-01T10:00:00",
+                responseTime=2000,
+                _account_email="one@example.com",
+            ),
+            make_record(
+                requestId="account-two",
+                requestTime="2026-01-01T10:00:00",
+                responseTime=2000,
+                _account_email="two@example.com",
+            ),
+        ]
+        event = {
+            "event": "upstream_response",
+            "time": "2026-01-01T10:00:02+08:00",
+            "source": "account-1",
+            "model": "gpt-5.6-sol",
+            "status": 200,
+            "switching": False,
+            "response_complete": True,
+            "first_byte_time_ms": 300,
+            "response_time_ms": 400,
+        }
+
+        self.assertEqual({}, dashboard_module.match_proxy_latencies(records, [event]))
+
+    def test_proxy_metrics_and_matching_share_one_event_file_read(self):
+        with tempfile.TemporaryDirectory(dir="test") as temp_dir:
+            log_path = Path(temp_dir) / "rawchat_proxy_2026-07-14.jsonl"
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "event": "upstream_response",
+                        "time": "2026-07-14T10:00:02+08:00",
+                        "response_complete": True,
+                        "first_byte_time_ms": 100,
+                        "response_time_ms": 200,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            original_open = io.open
+            with mock.patch.object(
+                io,
+                "open",
+                side_effect=lambda *args, **kwargs: original_open(
+                    *args, **kwargs
+                ),
+            ) as open_file:
+                dashboard_module.load_proxy_metrics(
+                    temp_dir, datetime(2026, 7, 14, 12, 0)
+                )
+                dashboard_module.load_proxy_latency_matches(
+                    temp_dir,
+                    [make_record(requestTime="2026-07-14T10:00:00")],
+                    datetime(2026, 7, 14, 12, 0),
+                )
+
+        self.assertEqual(1, open_file.call_count)
+
+    def test_proxy_latency_mapping_does_not_change_record_deduplication(self):
+        record = make_record(
+            requestId="same-record",
+            requestTime="2026-07-14T10:00:00",
+        )
+        key = monitor.record_key(record)
+        state = monitor.DashboardState(
+            all_records=[record],
+            proxy_latency_by_record_key={key: (125.0, 500.0)},
+        )
+
+        self.assertEqual(key, monitor.record_key(record))
+        self.assertEqual(1, len(state.all_records))
+        self.assertIn("0.12s", state.record_lines[0])
+        self.assertIn("0.50s", state.record_lines[0])
+
+        with tempfile.TemporaryDirectory(dir="test") as temp_dir:
+            store = monitor.RecordStore(
+                log_dir=temp_dir,
+                now=lambda: datetime(2026, 7, 14, 12, 0),
+            )
+            store.ingest([record])
+            store.ingest([dict(record)])
+
+            self.assertEqual(1, len(store.all_records()))
+            log_path = Path(store.log_path())
+            self.assertEqual(1, len(log_path.read_text(encoding="utf-8").splitlines()))
+
+    def test_repeated_refresh_keeps_unique_records_after_proxy_matching(self):
+        record = make_record(
+            requestId="refresh-record",
+            requestTime="2026-07-14T10:00:00",
+        )
+        snapshot = monitor.DashboardSnapshot(
+            {"recentRecords": [record]},
+            None,
+            None,
+            datetime(2026, 7, 14, 10, 1),
+        )
+
+        with tempfile.TemporaryDirectory(dir="test") as temp_dir:
+            store = monitor.RecordStore(
+                log_dir=temp_dir,
+                now=lambda: datetime(2026, 7, 14, 12, 0),
+            )
+            state = monitor.DashboardState(all_records=[])
+            outcome = monitor.RefreshOutcome(snapshot, None, 0)
+            key = monitor.record_key(record)
+
+            with mock.patch.object(
+                dashboard_module,
+                "load_proxy_metrics",
+                return_value=(1, 125.0, 500.0),
+            ), mock.patch.object(
+                dashboard_module,
+                "load_proxy_latency_matches",
+                return_value={key: (125.0, 500.0)},
+            ):
+                monitor.apply_outcome(state, outcome, store=store)
+                monitor.apply_outcome(state, outcome, store=store)
+
+            self.assertEqual(1, len(state.all_records))
+            self.assertEqual(1, len(store.all_records()))
+            self.assertEqual(
+                1,
+                len(Path(store.log_path()).read_text(encoding="utf-8").splitlines()),
+            )
+            self.assertNotIn("proxy", state.all_records[0])
+
+    def test_refresh_clears_stale_proxy_latency_when_no_match_remains(self):
+        record = make_record(
+            requestId="stale-match",
+            requestTime="2026-07-14T10:00:00",
+        )
+        state = monitor.DashboardState(
+            all_records=[record],
+            proxy_latency_by_record_key={
+                monitor.record_key(record): (125.0, 500.0)
+            },
+        )
+
+        dashboard_module.refresh_dashboard_data(
+            state,
+            proxy_latency_by_record_key={},
+        )
+
+        self.assertEqual({}, state.proxy_latency_by_record_key)
+        self.assertNotIn("0.12s", state.record_lines[0])
+        self.assertNotIn("0.50s", state.record_lines[0])
 
     def test_stats_lines_show_local_proxy_latency_averages(self):
         state = monitor.DashboardState(all_records=[make_record()])

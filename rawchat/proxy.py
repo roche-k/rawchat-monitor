@@ -5,6 +5,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -243,7 +244,9 @@ class RawChatProxyServer:
             f"rawchat_proxy_{_log_date(datetime.now())}.jsonl"
         )
         payload = {
-            "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "time": datetime.now().astimezone().isoformat(
+                timespec="microseconds"
+            ),
             "event": event,
             **fields,
         }
@@ -565,7 +568,9 @@ class RawChatProxyServer:
             return
 
         path = handler.path.partition("?")[0]
+        proxy_request_id = uuid.uuid4().hex
         request_event_fields: dict[str, Any] = {
+            "proxy_request_id": proxy_request_id,
             "method": handler.command,
             "path": path,
             "available_sources": self.source_pool.available_labels(),
@@ -727,6 +732,9 @@ class RawChatProxyServer:
                             response_finished_at = time.monotonic()
                             self._log_event(
                                 "upstream_response",
+                                proxy_request_id=proxy_request_id,
+                                model=input_fields.get("model"),
+                                source_email=source.email,
                                 source=self.source_pool.source_label(source.email),
                                 attempt=attempt,
                                 status=response.status_code,
@@ -776,6 +784,9 @@ class RawChatProxyServer:
                         response_finished_at = time.monotonic()
                         self._log_event(
                             "upstream_response",
+                            proxy_request_id=proxy_request_id,
+                            model=input_fields.get("model"),
+                            source_email=source.email,
                             source=self.source_pool.source_label(source.email),
                             attempt=attempt,
                             status=response.status_code,
@@ -822,6 +833,9 @@ class RawChatProxyServer:
                     )
                     self._log_event(
                         "upstream_response",
+                        proxy_request_id=proxy_request_id,
+                        model=input_fields.get("model"),
+                        source_email=source.email,
                         source=self.source_pool.source_label(source.email),
                         attempt=attempt,
                         status=response.status_code,

@@ -3,8 +3,9 @@
 import curses
 import json
 import unicodedata
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,7 @@ from .records import (
     _log_date,
     _number,
     _parse_datetime,
+    record_key,
 )
 
 
@@ -110,11 +112,303 @@ def fmt_request_time(value: Any) -> str:
     return parsed.strftime("%m-%d %H:%M:%S")
 
 
-def record_values(record: dict[str, Any]) -> tuple[str, ...]:
+ProxyLatency = tuple[float | None, float | None]
+
+_PROXY_MATCH_MAX_DELTA_MS = 3000.0
+_PROXY_MATCH_MIN_SCORE = 2500.0
+_PROXY_EVENTS_CACHE: dict[
+    tuple[str, int, int], tuple[int, list[dict[str, Any]]]
+] = {}
+
+
+def _proxy_model(value: Any) -> str:
+    """Normalize backend model suffixes to the model sent through the proxy."""
+    model = str(value or "").strip().lower()
+    for suffix in ("-xhigh", "-high", "-low", "-max"):
+        if model.endswith(suffix):
+            return model[: -len(suffix)]
+    return model
+
+
+def _proxy_record_completion(record: dict[str, Any]) -> datetime | None:
+    request_time = _parse_datetime(record.get("requestTime"))
+    response_time = _number(record.get("responseTime"))
+    if request_time is None or response_time is None or response_time < 0:
+        return None
+    return request_time + timedelta(milliseconds=response_time)
+
+
+def _proxy_event_time(event: dict[str, Any]) -> datetime | None:
+    return _parse_datetime(event.get("time"))
+
+
+def _proxy_status_success(event: dict[str, Any]) -> bool | None:
+    status = _number(event.get("status"))
+    if status is None:
+        return None
+    return 200 <= int(status) < 400
+
+
+def _proxy_response_candidates(
+    events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collapse retry attempts into one candidate per proxy request."""
+    grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    legacy: list[tuple[int, dict[str, Any]]] = []
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            continue
+        if event.get("response_complete") is not True:
+            continue
+        if (
+            _number(event.get("first_byte_time_ms")) is None
+            and _number(event.get("response_time_ms")) is None
+        ):
+            continue
+        request_id = str(event.get("proxy_request_id") or "").strip()
+        if request_id:
+            grouped.setdefault(request_id, []).append((index, event))
+        else:
+            # Older logs have no request id. Keep their non-switching response
+            # as the best available representation; switching attempts cannot
+            # be tied safely to a backend record without a request id.
+            if event.get("switching") is not True:
+                legacy.append((index, event))
+
+    candidates = legacy
+    for responses in grouped.values():
+        final_responses = [
+            item for item in responses if item[1].get("switching") is not True
+        ] or responses
+        candidates.append(
+            max(
+                final_responses,
+                key=lambda item: (
+                    int(_number(item[1].get("attempt")) or 0),
+                    _proxy_event_time(item[1]) or datetime.min,
+                    item[0],
+                ),
+            )
+        )
+    return [event for _, event in sorted(candidates, key=lambda item: item[0])]
+
+
+def _proxy_account_labels(
+    records: list[dict[str, Any]], source_pool: Any = None
+) -> dict[str, str]:
+    emails = sorted(
+        {
+            str(record.get("_account_email"))
+            for record in records
+            if record.get("_account_email")
+        }
+    )
+    labels: dict[str, str] = {}
+    if source_pool is not None:
+        source_label = getattr(source_pool, "source_label", None)
+        if callable(source_label):
+            for email in emails:
+                label = str(source_label(email) or "")
+                if label and label != "unknown":
+                    labels[email] = label
+    if len(emails) > 1:
+        # Keep the account count even when no source pool is available. Legacy
+        # account-N events are unsafe across multiple configured accounts.
+        for email in emails:
+            labels.setdefault(email, "")
+    # A single account is unambiguous even when no SourcePool is available.
+    if len(emails) == 1 and emails[0] not in labels:
+        labels[emails[0]] = "account-1"
+    return labels
+
+
+def _proxy_match_score(
+    record: dict[str, Any],
+    event: dict[str, Any],
+    account_labels: dict[str, str],
+) -> float | None:
+    completion = _proxy_record_completion(record)
+    event_time = _proxy_event_time(event)
+    if completion is None or event_time is None:
+        return None
+    delta_ms = abs((event_time - completion).total_seconds() * 1000.0)
+    if delta_ms > _PROXY_MATCH_MAX_DELTA_MS:
+        return None
+
+    record_model = _proxy_model(record.get("model"))
+    event_model = _proxy_model(event.get("model"))
+    if record_model and event_model and record_model != event_model:
+        return None
+
+    email = str(record.get("_account_email") or "")
+    account_label = account_labels.get(email)
+    event_source = str(event.get("source") or "")
+    event_email = str(event.get("source_email") or "").strip()
+    if event_email:
+        if not email or event_email != email:
+            return None
+    else:
+        if len(account_labels) > 1:
+            # Legacy account-N events cannot be safely remapped if account
+            # order changes, so only stable source_email events cross accounts.
+            return None
+        if (
+            account_label
+            and event_source
+            and event_source != "unknown"
+            and account_label != event_source
+        ):
+            return None
+
+    event_success = _proxy_status_success(event)
+    record_status = record.get("status")
+    switching = event.get("switching") is True
+    if record_status == "success" and (
+        switching or event_success is False
+    ):
+        return None
+    if record_status == "failed" and event_success is True and not switching:
+        return None
+
+    score = 1000.0 + max(0.0, _PROXY_MATCH_MAX_DELTA_MS - delta_ms)
+    if event_email and event_email == email:
+        score += 2000.0
+    elif account_label and event_source == account_label:
+        score += 1500.0
+    if record_model and event_model:
+        score += 1000.0
+        if str(record.get("model")).strip().lower() == str(
+            event.get("model")
+        ).strip().lower():
+            score += 250.0
+    if record_status and event_success is not None:
+        if (record_status == "success") == event_success:
+            score += 500.0
+    if event.get("response_complete") is True:
+        score += 250.0
+    if not switching:
+        score += 100.0
+    return score
+
+
+def match_proxy_latencies(
+    records: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    source_pool: Any = None,
+) -> dict[str, ProxyLatency]:
+    """Match proxy responses to backend records as a global best sequence.
+
+    Every record/event pair is scored first. Dynamic programming then selects
+    the highest-scoring order-preserving one-to-one sequence, while allowing
+    either side to remain unmatched when confidence is too low.
+    """
+    account_labels = _proxy_account_labels(records, source_pool)
+    ordered_records = sorted(
+        [
+            (index, record, completion)
+            for index, record in enumerate(records)
+            if isinstance(record, dict)
+            for completion in (_proxy_record_completion(record),)
+            if completion is not None
+        ],
+        key=lambda item: (item[2], item[0]),
+    )
+    response_candidates = _proxy_response_candidates(events)
+    ordered_events = sorted(
+        [
+            (index, event, event_time)
+            for index, event in enumerate(response_candidates)
+            for event_time in (_proxy_event_time(event),)
+            if event_time is not None
+        ],
+        key=lambda item: (item[2], item[0]),
+    )
+    record_count = len(ordered_records)
+    event_count = len(ordered_events)
+    if not record_count or not event_count:
+        return {}
+
+    record_times = [completion for _, _, completion in ordered_records]
+    # Fenwick nodes hold the best sequence ending at each record position.
+    # Only candidate edges inside the time window are scored, so refresh cost
+    # grows with actual ambiguity instead of the full history cross-product.
+    fenwick: list[tuple[float, int] | None] = [None] * (record_count + 1)
+    nodes: list[tuple[int, int, int | None]] = []
+
+    def better(
+        left: tuple[float, int] | None,
+        right: tuple[float, int] | None,
+    ) -> tuple[float, int] | None:
+        if left is None or (right is not None and right[0] > left[0]):
+            return right
+        return left
+
+    def query(position: int) -> tuple[float, int] | None:
+        result: tuple[float, int] | None = None
+        while position > 0:
+            result = better(result, fenwick[position])
+            position -= position & -position
+        return result
+
+    def update(position: int, value: tuple[float, int]) -> None:
+        while position <= record_count:
+            fenwick[position] = better(fenwick[position], value)
+            position += position & -position
+
+    for event_index, (_, event, event_time) in enumerate(ordered_events):
+        lower = event_time - timedelta(milliseconds=_PROXY_MATCH_MAX_DELTA_MS)
+        upper = event_time + timedelta(milliseconds=_PROXY_MATCH_MAX_DELTA_MS)
+        first_record = bisect_left(record_times, lower)
+        last_record = bisect_right(record_times, upper)
+        pending: list[tuple[int, tuple[float, int]]] = []
+        for record_index in range(first_record, last_record):
+            _, record, _ = ordered_records[record_index]
+            score = _proxy_match_score(record, event, account_labels)
+            if score is None or score < _PROXY_MATCH_MIN_SCORE:
+                continue
+            previous = query(record_index)
+            total = score + (previous[0] if previous is not None else 0.0)
+            node_index = len(nodes)
+            nodes.append(
+                (
+                    record_index,
+                    event_index,
+                    previous[1] if previous is not None else None,
+                )
+            )
+            pending.append((record_index + 1, (total, node_index)))
+        # Delay updates until this event is fully scored; otherwise two edges
+        # from the same proxy event could be chained together.
+        for position, value in pending:
+            update(position, value)
+
+    best = query(record_count)
+    matches: dict[str, ProxyLatency] = {}
+    node_index = best[1] if best is not None else None
+    while node_index is not None:
+        record_index, event_index, node_index = nodes[node_index]
+        _, record, _ = ordered_records[record_index]
+        _, event, _ = ordered_events[event_index]
+        matches[record_key(record)] = (
+            _number(event.get("first_byte_time_ms")),
+            _number(event.get("response_time_ms")),
+        )
+    return matches
+
+
+def record_values(
+    record: dict[str, Any], proxy_latencies: ProxyLatency | None = None
+) -> tuple[str, ...]:
     """返回与网页 Codex 调用表一致的可见字段（含账户列）。"""
     status = record.get("status")
     status_text = {"success": "成功", "failed": "失败"}.get(status, "-")
     account = str(record.get("_account_email") or "-")
+    proxy_first_byte = (
+        proxy_latencies[0] if proxy_latencies is not None else None
+    )
+    proxy_response = (
+        proxy_latencies[1] if proxy_latencies is not None else None
+    )
     return (
         fmt_request_time(record.get("requestTime")),
         str(record.get("model") or "-"),
@@ -131,6 +425,8 @@ def record_values(record: dict[str, Any]) -> tuple[str, ...]:
         fmt_cost(record.get("cost")),
         fmt_duration(record.get("responseTime")),
         fmt_duration(record.get("firstByteTime")),
+        fmt_duration(proxy_first_byte),
+        fmt_duration(proxy_response),
         status_text,
         account,
         str(record.get("ip") or "-"),
@@ -151,6 +447,8 @@ TABLE_COLUMNS = (
     ("实付", 12, "right"),
     ("响应耗时", 10, "right"),
     ("首字耗时", 10, "right"),
+    ("代理首字耗时", 14, "right"),
+    ("代理响应耗时", 14, "right"),
     ("状态", 8, "center"),
     ("账户", 24, "left"),
     ("IP", 15, "left"),
@@ -223,8 +521,10 @@ def table_header_line() -> str:
     return _table_line([column[0] for column in TABLE_COLUMNS])
 
 
-def table_record_line(record: dict[str, Any]) -> str:
-    return _table_line(record_values(record))
+def table_record_line(
+    record: dict[str, Any], proxy_latencies: ProxyLatency | None = None
+) -> str:
+    return _table_line(record_values(record, proxy_latencies))
 
 
 TABLE_WIDTH = display_width(table_header_line())
@@ -251,6 +551,9 @@ class DashboardState:
     proxy_request_total: int = 0
     proxy_avg_first_byte_ms: float | None = None
     proxy_avg_response_ms: float | None = None
+    proxy_latency_by_record_key: dict[str, ProxyLatency] = field(
+        default_factory=dict
+    )
     proxy_config: Any = None
 
     def __post_init__(self) -> None:
@@ -361,21 +664,24 @@ def load_proxy_request_total(
     return load_proxy_metrics(log_dir, now)[0]
 
 
-def load_proxy_metrics(
+def _load_proxy_events(
     log_dir: str | Path,
     now: datetime | None = None,
-) -> tuple[int, float | None, float | None]:
-    """聚合当天代理事件日志，返回 (请求总数, 首字延迟均值ms, 响应延迟均值ms)。
-
-    延迟来自本地代理实测的 upstream_response 事件（first_byte_time_ms /
-    response_time_ms），仅统计完整转发的响应。
-    """
+) -> tuple[int, list[dict[str, Any]]]:
     path = Path(log_dir) / (
         f"rawchat_proxy_{_log_date(now or datetime.now())}.jsonl"
     )
+    try:
+        stat = path.stat()
+        cache_key = (str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        cache_key = (str(path), 0, 0)
+    cached = _PROXY_EVENTS_CACHE.get(cache_key)
+    if cached is not None:
+        total, events = cached
+        return total, list(events)
     total = 0
-    first_byte_values: list[float] = []
-    response_values: list[float] = []
+    response_events: list[dict[str, Any]] = []
     try:
         with path.open(encoding="utf-8") as handle:
             for line in handle:
@@ -387,19 +693,36 @@ def load_proxy_metrics(
                     continue
                 if event.get("event") == "request_received":
                     total += 1
-                    continue
-                if event.get("event") != "upstream_response":
-                    continue
-                if event.get("response_complete") is not True:
-                    continue
-                first_byte = _number(event.get("first_byte_time_ms"))
-                response = _number(event.get("response_time_ms"))
-                if first_byte is not None:
-                    first_byte_values.append(first_byte)
-                if response is not None:
-                    response_values.append(response)
+                elif event.get("event") == "upstream_response":
+                    response_events.append(event)
     except OSError:
-        return 0, None, None
+        return 0, []
+    _PROXY_EVENTS_CACHE.clear()
+    _PROXY_EVENTS_CACHE[cache_key] = (total, response_events)
+    return total, response_events
+
+
+def load_proxy_metrics(
+    log_dir: str | Path,
+    now: datetime | None = None,
+) -> tuple[int, float | None, float | None]:
+    """聚合当天代理事件日志，返回 (请求总数, 首字延迟均值ms, 响应延迟均值ms)。
+
+    延迟来自本地代理实测的 upstream_response 事件（first_byte_time_ms /
+    response_time_ms），仅统计完整转发的响应。
+    """
+    total, events = _load_proxy_events(log_dir, now)
+    first_byte_values: list[float] = []
+    response_values: list[float] = []
+    for event in events:
+        if event.get("response_complete") is not True:
+            continue
+        first_byte = _number(event.get("first_byte_time_ms"))
+        response = _number(event.get("response_time_ms"))
+        if first_byte is not None:
+            first_byte_values.append(first_byte)
+        if response is not None:
+            response_values.append(response)
     avg_first_byte = (
         sum(first_byte_values) / len(first_byte_values)
         if first_byte_values
@@ -411,15 +734,35 @@ def load_proxy_metrics(
     return total, avg_first_byte, avg_response
 
 
+def load_proxy_latency_matches(
+    log_dir: str | Path,
+    records: list[dict[str, Any]],
+    now: datetime | None = None,
+    source_pool: Any = None,
+) -> dict[str, ProxyLatency]:
+    """Load today's completed proxy events and match them to backend rows."""
+    _, events = _load_proxy_events(log_dir, now)
+    return match_proxy_latencies(records, events, source_pool)
+
+
 def refresh_dashboard_data(
     state: DashboardState,
     proxy_request_total: int | None = None,
     proxy_metrics: tuple[float | None, float | None] | None = None,
+    proxy_latency_by_record_key: dict[str, ProxyLatency] | None = None,
 ) -> None:
     """Build backend-derived dashboard data outside the rendering path."""
     records = state.all_records if state.all_records else _records(state.snapshot)
+    if proxy_latency_by_record_key is not None:
+        state.proxy_latency_by_record_key = dict(proxy_latency_by_record_key)
     state.statistics = compute_statistics(records)
-    state.record_lines = [table_record_line(record) for record in records]
+    state.record_lines = [
+        table_record_line(
+            record,
+            state.proxy_latency_by_record_key.get(record_key(record)),
+        )
+        for record in records
+    ]
     state.token_buckets = build_token_buckets(records, CHART_BUCKET_MINUTES)
     state.account_record_counts = {}
     state.unassigned_record_count = 0
@@ -538,11 +881,21 @@ def apply_outcome(
     else:
         state.all_records = list(_records(state.snapshot))
     request_total, avg_first_byte, avg_response = load_proxy_metrics(LOG_DIR)
-    refresh_dashboard_data(
-        state,
-        proxy_request_total=request_total,
-        proxy_metrics=(avg_first_byte, avg_response),
+    proxy_latency_by_record_key = load_proxy_latency_matches(
+        LOG_DIR,
+        state.all_records,
+        datetime.now(),
+        state.source_pool,
     )
+    refresh_kwargs: dict[str, Any] = {
+        "proxy_request_total": request_total,
+        "proxy_metrics": (avg_first_byte, avg_response),
+    }
+    if proxy_latency_by_record_key or state.proxy_latency_by_record_key:
+        refresh_kwargs["proxy_latency_by_record_key"] = (
+            proxy_latency_by_record_key
+        )
+    refresh_dashboard_data(state, **refresh_kwargs)
 
     new_records = _records(state.snapshot)
     if selected_id is not None:
