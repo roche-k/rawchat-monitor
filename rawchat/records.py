@@ -57,14 +57,6 @@ def _number(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _is_noise(record: dict[str, Any]) -> bool:
-    """过滤 API 返回的无效记录（失败且无实际消耗）。"""
-    return (
-        record.get("status") == "failed"
-        and int(_number(record.get("totalTokens")) or 0) == 0
-    )
-
-
 def record_key(record: dict[str, Any]) -> str:
     """全字段去重 key：对记录所有字段做规范化后计算稳定哈希。"""
     payload = json.dumps(
@@ -127,8 +119,6 @@ class RecordStore:
                         continue
                     if not isinstance(record, dict):
                         continue
-                    if _is_noise(record):
-                        continue
                     # 只加载当天的记录，忽略跨天混入的旧数据
                     rt = _parse_datetime(record.get("requestTime"))
                     if rt is None or _log_date(rt) != today:
@@ -166,8 +156,6 @@ class RecordStore:
         today = _log_date(self.now())
         for record in records:
             if not isinstance(record, dict):
-                continue
-            if _is_noise(record):
                 continue
             rt = _parse_datetime(record.get("requestTime"))
             if rt is None or _log_date(rt) != today:

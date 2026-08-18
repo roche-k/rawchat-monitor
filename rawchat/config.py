@@ -32,7 +32,7 @@ QUOTA_URL = f"{BASE_URL}/frontend-api/vibe-code/quota"
 RECORDS_URL = f"{BASE_URL}/frontend-api/vibe-code/records"
 GETME_URL = f"{BASE_URL}/frontend-api/getme"
 ROLLING_LIMIT_URL = (
-    f"{API_BASE_URL}/frontend-api/vibe-code/codex/rolling-limit"
+    f"{BASE_URL}/frontend-api/vibe-code/codex/rolling-limit"
 )
 BALANCE_URL = (
     f"{BASE_URL}/frontend-api/vibe-code/codex/billing-profile"

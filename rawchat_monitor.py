@@ -118,7 +118,6 @@ from rawchat.proxy import RawChatProxyServer, _codex_quota_headers
 from rawchat.records import (
     DashboardSnapshot,
     RecordStore,
-    _is_noise,
     _log_date,
     _number,
     _parse_datetime,

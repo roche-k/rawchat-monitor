@@ -2787,7 +2787,7 @@ class ClientTests(unittest.TestCase):
         client.fetch_rolling_limit("user-token")
 
         self.assertEqual(
-            "https://api.rawchat.cn/frontend-api/vibe-code/codex/rolling-limit",
+            "https://rawchat.cn/frontend-api/vibe-code/codex/rolling-limit",
             session.post.call_args.args[0],
         )
 
@@ -4134,6 +4134,64 @@ class RecordStoreTests(unittest.TestCase):
         with open(log_path, encoding="utf-8") as handle:
             lines = [line for line in handle.read().splitlines() if line]
         self.assertEqual(3, len(lines))
+
+    def test_failed_zero_token_records_are_kept_and_match_proxy_failures(self):
+        record = {
+            "requestId": "failed-zero-token",
+            "requestTime": "2026-07-14T10:00:00",
+            "model": "gpt-5.6-sol-max",
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "cacheInputTokens": 0,
+            "cacheWriteTokens": 0,
+            "reasoningTokens": 0,
+            "totalTokens": 0,
+            "cost": 0,
+            "responseTime": 1000,
+            "firstByteTime": None,
+            "status": "failed",
+            "errorMessage": "client_aborted",
+            "_account_email": "one@example.com",
+        }
+        with tempfile.TemporaryDirectory(dir="test") as log_dir:
+            store = monitor.RecordStore(
+                log_dir=log_dir,
+                now=lambda: datetime(2026, 7, 14, 12, 0),
+            )
+
+            self.assertEqual([record], store.ingest([record]))
+            self.assertEqual([record], store.all_records())
+
+            reopened = monitor.RecordStore(
+                log_dir=log_dir,
+                now=lambda: datetime(2026, 7, 14, 12, 0),
+            )
+            self.assertEqual([record], reopened.all_records())
+
+            matches = dashboard_module.match_proxy_latencies(
+                reopened.all_records(),
+                [
+                    {
+                        "event": "upstream_response",
+                        "time": "2026-07-14T10:00:01",
+                        "proxy_request_id": "proxy-failed-zero-token",
+                        "source_email": "one@example.com",
+                        "model": "gpt-5.6-sol",
+                        "status": 502,
+                        "switching": False,
+                        "response_complete": True,
+                        "first_byte_time_ms": 100,
+                        "response_time_ms": 1000,
+                    }
+                ],
+            )
+
+        self.assertEqual(
+            {monitor.record_key(record): (100.0, 1000.0)}, matches
+        )
+        stats = monitor.compute_statistics([record])
+        self.assertEqual(1, stats["by_ip"]["-"]["count"])
+        self.assertEqual(0.0, stats["by_ip"]["-"]["success_rate"])
 
     def test_store_loads_todays_records_on_startup(self):
         self.assertTrue(hasattr(monitor, "RecordStore"))
