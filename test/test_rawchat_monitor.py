@@ -1715,8 +1715,8 @@ class ProxyTests(unittest.TestCase):
             with mock.patch.object(
                 monitor.requests, "Session", return_value=session_context
             ), mock.patch.object(
-                proxy_config, "handle_failure", return_value=False
-            ) as handle_failure:
+                proxy_config, "report_failure"
+            ) as report_failure:
                 proxy._handle_request(handler)
 
             paths = list(Path(temp_dir).glob("rawchat_proxy_*.jsonl"))
@@ -1725,7 +1725,7 @@ class ProxyTests(unittest.TestCase):
                 for line in paths[0].read_text(encoding="utf-8").splitlines()
             ]
 
-        handle_failure.assert_called_once_with(
+        report_failure.assert_called_once_with(
             read_error,
             reason="上游流读取失败",
             target="https://example.invalid/v1/responses",
@@ -1992,7 +1992,7 @@ class ProxyTests(unittest.TestCase):
 
         handler.send_response.assert_called_once_with(502)
 
-    def test_proxy_retries_direct_after_proxy_connection_error(self):
+    def test_proxy_retries_through_proxy_after_proxy_connection_error(self):
         pool = monitor.SourcePool(
             [{"email": "one@example.com", "password": "p1"}],
             keys={"one@example.com": "key-1"},
@@ -2026,20 +2026,40 @@ class ProxyTests(unittest.TestCase):
 
         with mock.patch.object(
             monitor.requests, "Session", return_value=session_context
-        ), mock.patch.object(proxy_config, "handle_failure", return_value=True) as handle_failure:
+        ), mock.patch.object(proxy_config, "report_failure") as report_failure:
             proxy._handle_request(handler)
 
         self.assertEqual(2, session.request.call_count)
         self.assertEqual(
-            {"http": None, "https": None},
+            {"http": "socks5://127.0.0.1:1080", "https": "socks5://127.0.0.1:1080"},
             session.request.call_args.kwargs["proxies"],
         )
         handler.send_response.assert_called_once_with(200)
         self.assertEqual(b"{}", handler.wfile.getvalue())
         self.assertTrue(proxy_config.requests_proxies())
-        handle_failure.assert_called_once()
+        report_failure.assert_called_once()
 
-    def test_proxy_retries_direct_after_xray_error_response(self):
+    def test_proxy_connection_failure_reports_failure_without_blocking_health_check(self):
+        proxy_config = monitor.ProxyConfig(socks="127.0.0.1:1080")
+        health_started = threading.Event()
+
+        def check_health():
+            health_started.set()
+            return True
+
+        with mock.patch.object(proxy_config, "check_health", side_effect=check_health):
+            caller = threading.current_thread()
+            proxy_config.report_failure(
+                requests.ConnectionError("proxy reset"),
+                reason="上游连接失败",
+                target="https://example.invalid/v1/responses",
+            )
+            self.assertTrue(proxy_config.requests_proxies())
+            self.assertTrue(health_started.wait(1.0))
+            self.assertIsNot(caller, proxy_config._failure_worker)
+        proxy_config.stop()
+
+    def test_proxy_retries_through_proxy_after_xray_error_response(self):
         pool = monitor.SourcePool(
             [{"email": "one@example.com", "password": "p1"}],
             keys={"one@example.com": "key-1"},
@@ -2079,21 +2099,81 @@ class ProxyTests(unittest.TestCase):
 
         with mock.patch.object(
             monitor.requests, "Session", return_value=session_context
-        ), mock.patch.object(proxy_config, "handle_failure", return_value=True) as handle_failure:
+        ), mock.patch.object(proxy_config, "report_failure") as report_failure:
             proxy._handle_request(handler)
 
         self.assertEqual(2, session.request.call_count)
         self.assertEqual(
-            {"http": None, "https": None},
+            {"http": "socks5://127.0.0.1:1080", "https": "socks5://127.0.0.1:1080"},
             session.request.call_args.kwargs["proxies"],
         )
         handler.send_response.assert_called_once_with(200)
         self.assertEqual(b"{}", handler.wfile.getvalue())
         self.assertTrue(proxy_config.requests_proxies())
         proxy_response.close.assert_called_once_with()
-        handle_failure.assert_called_once_with(
+        report_failure.assert_called_once_with(
             reason="代理返回错误", target="https://example.invalid/v1/responses"
         )
+
+    def test_async_proxy_failure_switches_to_direct_after_failed_health_check(self):
+        proxy_config = monitor.ProxyConfig(socks="127.0.0.1:1080")
+        health_finished = threading.Event()
+
+        def failed_health_check():
+            health_finished.set()
+            return False
+
+        with mock.patch.object(
+            proxy_config, "check_health", side_effect=failed_health_check
+        ):
+            proxy_config.report_failure(requests.ConnectionError("proxy reset"))
+            self.assertTrue(health_finished.wait(1.0))
+
+        deadline = time.monotonic() + 1.0
+        while proxy_config.requests_proxies() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual({}, proxy_config.requests_proxies())
+        proxy_config.stop()
+
+    def test_async_health_check_retries_transient_failures_before_recovery(self):
+        proxy_config = monitor.ProxyConfig(socks="127.0.0.1:1080")
+        health_finished = threading.Event()
+        health_results = iter((False, False, True))
+
+        def check_health():
+            result = next(health_results)
+            if result:
+                health_finished.set()
+            return result
+
+        with mock.patch.object(proxy_config, "check_health", side_effect=check_health):
+            with mock.patch("rawchat.config.time.sleep") as sleep:
+                proxy_config.report_failure()
+                self.assertTrue(health_finished.wait(1.0))
+                deadline = time.monotonic() + 1.0
+                while proxy_config._failure_check_queued and time.monotonic() < deadline:
+                    time.sleep(0.01)
+
+        self.assertTrue(proxy_config.requests_proxies())
+        self.assertEqual([mock.call(0.5), mock.call(0.5)], sleep.call_args_list)
+        proxy_config.stop()
+
+    def test_async_proxy_health_check_exception_falls_back_and_worker_exits(self):
+        proxy_config = monitor.ProxyConfig(socks="127.0.0.1:1080")
+        with mock.patch.object(
+            proxy_config, "check_health", side_effect=RuntimeError("health failed")
+        ):
+            proxy_config.report_failure()
+            deadline = time.monotonic() + 1.0
+            while proxy_config.requests_proxies() and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        self.assertEqual({}, proxy_config.requests_proxies())
+        worker = proxy_config._failure_worker
+        self.assertIsNotNone(worker)
+        proxy_config.stop()
+        worker.join(1.0)
+        self.assertFalse(worker.is_alive())
 
     def test_managed_xray_process_is_started_and_stopped(self):
         proxy_config = monitor.ProxyConfig(url=self.VLESS_LINK, xray="xray")

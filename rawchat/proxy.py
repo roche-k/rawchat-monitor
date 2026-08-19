@@ -636,23 +636,18 @@ class RawChatProxyServer:
                     except (OSError, requests.RequestException) as exc:
                         if not proxy_active or self.proxy is None:
                             raise
-                        use_direct = self.proxy.handle_failure(
+                        self.proxy.report_failure(
                             exc,
                             reason="上游连接失败",
                             target=url,
                         )
-                        proxy_active = not use_direct
                         response = session.request(
                             handler.command,
                             url,
                             headers=headers,
                             data=body,
                             stream=True,
-                            proxies=(
-                                {"http": None, "https": None}
-                                if use_direct
-                                else proxy_urls
-                            ),
+                            proxies=proxy_urls,
                             timeout=(
                                 UPSTREAM_CONNECT_TIMEOUT,
                                 UPSTREAM_READ_TIMEOUT,
@@ -670,7 +665,7 @@ class RawChatProxyServer:
                             response.close()
                         except Exception:
                             handler.close_connection = True
-                        use_direct = self.proxy.handle_failure(
+                        self.proxy.report_failure(
                             reason="代理返回错误",
                             target=url,
                         )
@@ -680,17 +675,12 @@ class RawChatProxyServer:
                             headers=headers,
                             data=body,
                             stream=True,
-                            proxies=(
-                                {"http": None, "https": None}
-                                if use_direct
-                                else proxy_urls
-                            ),
+                            proxies=proxy_urls,
                             timeout=(
                                 UPSTREAM_CONNECT_TIMEOUT,
                                 UPSTREAM_READ_TIMEOUT,
                             ),
                         )
-                        proxy_active = not use_direct
                     first_byte_at = time.monotonic()
                     quota_candidate = response.status_code in {402, 403, 429}
                     error_body = b""
@@ -809,9 +799,8 @@ class RawChatProxyServer:
                         self._inject_codex_quota_headers(response)
 
                     def on_stream_error(error: BaseException) -> None:
-                        fallback = False
                         if proxy_active and self.proxy is not None:
-                            fallback = self.proxy.handle_failure(
+                            self.proxy.report_failure(
                                 error,
                                 reason="上游流读取失败",
                                 target=url,
@@ -825,7 +814,7 @@ class RawChatProxyServer:
                             error_message=ProxyConfig._error_message(error),
                             target=url,
                             proxy_active=proxy_active,
-                            fallback=fallback,
+                            fallback=proxy_active and self.proxy is not None,
                         )
 
                     response_finished_at, response_complete = self._send_stream(

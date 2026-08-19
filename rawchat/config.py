@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import queue
 import shutil
 import socket
 import subprocess
@@ -63,6 +64,8 @@ XRAY_START_TIMEOUT = 5.0
 XRAY_STOP_TIMEOUT = 1.0
 PROXY_HEALTHCHECK_URL = "https://www.google.com/generate_204"
 PROXY_HEALTHCHECK_TIMEOUT = (5, 10)
+PROXY_HEALTHCHECK_ATTEMPTS = 3
+PROXY_HEALTHCHECK_RETRY_DELAY = 0.5
 
 
 def _query_value(query: dict[str, str], *names: str, default: str = "") -> str:
@@ -324,6 +327,18 @@ class ProxyConfig:
     _failure_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False, compare=False
     )
+    _failure_queue: queue.Queue[
+        tuple[BaseException | None, str, str | None] | None
+    ] = field(default_factory=queue.Queue, init=False, repr=False, compare=False)
+    _failure_worker: threading.Thread | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _failure_check_queued: bool = field(
+        default=False, init=False, repr=False, compare=False
+    )
+    _failure_stopping: bool = field(
+        default=False, init=False, repr=False, compare=False
+    )
     _lock: threading.RLock = field(
         default_factory=threading.RLock, init=False, repr=False, compare=False
     )
@@ -527,6 +542,14 @@ class ProxyConfig:
                 except Exception:
                     pass
 
+    def _check_health_with_retries(self) -> bool:
+        for attempt in range(PROXY_HEALTHCHECK_ATTEMPTS):
+            if self.check_health():
+                return True
+            if attempt + 1 < PROXY_HEALTHCHECK_ATTEMPTS:
+                time.sleep(PROXY_HEALTHCHECK_RETRY_DELAY)
+        return False
+
     def handle_failure(
         self,
         error: BaseException | None = None,
@@ -549,7 +572,7 @@ class ProxyConfig:
                 proxy_kind=proxy_kind,
                 target=target,
             )
-            if self.check_health():
+            if self._check_health_with_retries():
                 self._emit_event(
                     "proxy_failure_recovered",
                     reason=reason,
@@ -561,6 +584,97 @@ class ProxyConfig:
                 if self._state == "active":
                     self._fail_unlocked(reason, error=error)
             return True
+
+    def report_failure(
+        self,
+        error: BaseException | None = None,
+        *,
+        reason: str = "代理连接失败",
+        target: str | None = None,
+    ) -> None:
+        """Queue a health check without blocking a request forwarding thread."""
+        with self._failure_lock:
+            if self._failure_stopping:
+                return
+            with self._lock:
+                self._poll_process_unlocked()
+                if self._state != "active" or not self._active_socks:
+                    return
+                proxy_kind = self._proxy_kind_unlocked()
+            self._emit_event(
+                "proxy_failure_detected",
+                reason=reason,
+                error_type=type(error).__name__ if error else None,
+                error_message=self._error_message(error),
+                proxy_kind=proxy_kind,
+                target=target,
+            )
+            if self._failure_check_queued:
+                return
+            self._failure_check_queued = True
+            worker = self._failure_worker
+            if worker is None or not worker.is_alive():
+                worker = threading.Thread(
+                    target=self._run_failure_worker,
+                    name="rawchat-proxy-fallback",
+                    daemon=True,
+                )
+                self._failure_worker = worker
+                worker.start()
+            self._failure_queue.put((error, reason, target))
+
+    def _run_failure_worker(self) -> None:
+        while True:
+            item = self._failure_queue.get()
+            if item is None:
+                return
+            error, reason, target = item
+            try:
+                if self._check_health_with_retries():
+                    with self._lock:
+                        proxy_kind = self._proxy_kind_unlocked()
+                    self._emit_event(
+                        "proxy_failure_recovered",
+                        reason=reason,
+                        proxy_kind=proxy_kind,
+                        target=target,
+                    )
+                else:
+                    with self._lock:
+                        if self._state == "active":
+                            self._fail_unlocked(reason, error=error)
+            except Exception as exc:
+                self._emit_event(
+                    "proxy_health_check_error",
+                    reason=reason,
+                    error_type=type(exc).__name__,
+                    error_message=self._error_message(exc),
+                    target=target,
+                )
+                with self._lock:
+                    if self._state == "active":
+                        self._fail_unlocked(reason, error=error or exc)
+            finally:
+                with self._failure_lock:
+                    self._failure_check_queued = False
+
+    def _stop_failure_worker(self) -> None:
+        with self._failure_lock:
+            self._failure_stopping = True
+            worker = self._failure_worker
+            self._failure_worker = None
+            self._failure_check_queued = False
+            if worker is not None:
+                self._failure_queue.put(None)
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(
+                timeout=(
+                    PROXY_HEALTHCHECK_ATTEMPTS * sum(PROXY_HEALTHCHECK_TIMEOUT)
+                    + (PROXY_HEALTHCHECK_ATTEMPTS - 1)
+                    * PROXY_HEALTHCHECK_RETRY_DELAY
+                    + XRAY_STOP_TIMEOUT
+                )
+            )
 
     def _stop_process_unlocked(self) -> None:
         process = self._process
@@ -588,6 +702,8 @@ class ProxyConfig:
             self._config_path = None
 
     def start(self) -> None:
+        with self._failure_lock:
+            self._failure_stopping = False
         with self._lock:
             if not self.configured or self._state in {"active", "failed"}:
                 return
@@ -649,6 +765,7 @@ class ProxyConfig:
                 self._fail_unlocked("Xray 启动失败", error=exc)
 
     def stop(self) -> None:
+        self._stop_failure_worker()
         with self._lock:
             self._active_socks = ""
             self._state = "inactive"
