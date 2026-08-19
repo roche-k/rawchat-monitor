@@ -82,6 +82,11 @@ class ModuleBoundaryTests(unittest.TestCase):
 
 
 class SnapshotFormattingTests(unittest.TestCase):
+    def test_display_width_uses_terminal_cell_widths(self):
+        self.assertEqual(0, monitor.char_width("\u0301"))
+        self.assertEqual(1, monitor.char_width("\u2191"))
+        self.assertEqual(2, monitor.char_width("中"))
+
     def test_normalize_codex_keeps_newest_twenty(self):
         self.assertTrue(hasattr(monitor, "normalize_codex_data"))
         records = [
@@ -3381,6 +3386,29 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(6, layout.stats_rows)
         self.assertEqual(9, layout.chart_rows)
         self.assertEqual(7, layout.chart_y)
+
+    def test_render_clips_wide_character_stats_to_terminal_width(self):
+        screen = FakeWindow(30, 50)
+        state = self.state(1)
+        state.proxy_request_total = 23
+        state.proxy_avg_first_byte_ms = 125.0
+        state.proxy_avg_response_ms = 500.0
+
+        with mock.patch.object(
+            monitor.curses,
+            "newpad",
+            side_effect=lambda rows, columns: FakeWindow(rows, columns),
+        ), mock.patch.object(monitor.curses, "doupdate"), mock.patch.object(
+            monitor.curses,
+            "color_pair",
+            return_value=0,
+        ):
+            monitor.render_dashboard(
+                screen, state, datetime(2026, 7, 14, 10, 20), 0.0
+            )
+
+        stats_write = next(write for write in screen.writes if write[0] == 1)
+        self.assertLessEqual(monitor.display_width(stats_write[2]), 49)
 
     def test_render_places_chart_at_reserved_layout_row(self):
         screen = FakeWindow(30, 120)

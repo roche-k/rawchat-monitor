@@ -32,6 +32,11 @@ from .records import (
     record_key,
 )
 
+try:
+    from wcwidth import wcwidth as _wcwidth
+except ImportError:  # pragma: no cover - exercised only in minimal installs
+    _wcwidth = None
+
 
 def fmt_cost(cost: Any) -> str:
     """格式化费用"""
@@ -456,6 +461,10 @@ TABLE_COLUMNS = (
 
 
 def char_width(char: str) -> int:
+    if _wcwidth is not None:
+        width = _wcwidth(char)
+        if width >= 0:
+            return width
     if unicodedata.combining(char):
         return 0
     return 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
@@ -1268,7 +1277,9 @@ def render_dashboard(
     )
     for y, line in enumerate(summary_lines):
         attr = _color(COLOR_ERROR) if y == 0 and state.error else 0
-        _safe_addnstr(stdscr, y, 0, line, columns - 1, attr)
+        _safe_addnstr(
+            stdscr, y, 0, slice_display(line, 0, columns - 1), columns - 1, attr
+        )
 
     stats_lines = build_stats_lines(state, columns - 1)
     for y, line in enumerate(stats_lines):
@@ -1276,7 +1287,7 @@ def render_dashboard(
             stdscr,
             layout.header_rows + y,
             0,
-            line,
+            slice_display(line, 0, columns - 1),
             columns - 1,
             _color(COLOR_HEADER),
         )
@@ -1292,7 +1303,7 @@ def render_dashboard(
             stdscr,
             layout.chart_y + offset,
             0,
-            line,
+            slice_display(line, 0, columns - 1),
             columns - 1,
         )
 
